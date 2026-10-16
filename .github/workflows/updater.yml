@@ -32,9 +32,11 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libxkbcommon-dev
       - name: Updater and restart tests
-        run: cargo test --locked -p effectcraft update::
+        run: |
+          cargo test --locked -p effectcraft update::
       - name: Save prompt tests
-        run: cargo test --locked -p effectcraft-ui-egui --lib panels::unsaved::tests
+        run: |
+          cargo test --locked -p effectcraft-ui-egui --lib panels::unsaved::tests
       - name: Windows portable replacement and rollback
         if: runner.os == 'Windows'
         shell: powershell
