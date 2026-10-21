@@ -406,12 +406,17 @@ pub fn fractal_gpu(ctx: &EffectCtx, offset: [f64; 2], scale: f64, turbulent: boo
         sub_rotation: fr.sub_rotation != 0.0,
         norm,
         octaves,
-        mode: match ctx.params.get("blendingMode").map(Value::as_enum).unwrap_or(BLEND_NONE) {
-            BLEND_NONE => None,
-            m => Some(BLEND_MODES.get(m as usize).and_then(|l| BlendMode::from_name(l)).unwrap_or(BlendMode::Normal)),
-        },
+        mode: blend_mode(ctx.params.get("blendingMode").map(Value::as_enum).unwrap_or(BLEND_NONE)),
         opacity: (ctx.params.f("opacity") as f32 / 100.0).clamp(0.0, 1.0),
         blend: ctx.params.f("blend") as f32 / 100.0,
+    }
+}
+
+/// Resolve a Blending Mode index: None → `None`, unknown → Normal.
+fn blend_mode(m: u32) -> Option<BlendMode> {
+    match m {
+        BLEND_NONE => None,
+        m => Some(BLEND_MODES.get(m as usize).and_then(|l| BlendMode::from_name(l)).unwrap_or(BlendMode::Normal)),
     }
 }
 
@@ -431,14 +436,11 @@ pub fn overflow(v: f32, mode: u32) -> f32 {
 /// Composite grey noise `val` over the original pixel by Blending Mode, Opacity and (ours) Blend
 /// With Original. The noise stays inside the layer's alpha, so a masked solid shows it only within
 /// its masks (#939).
-pub(crate) fn composite(orig: [f32; 4], val: f32, opacity: f32, mode: u32, blend_orig: f32) -> [f32; 4] {
+pub(crate) fn composite(orig: [f32; 4], val: f32, opacity: f32, mode: Option<BlendMode>, blend_orig: f32) -> [f32; 4] {
     let src = [val * opacity, val * opacity, val * opacity, opacity];
     let out = match mode {
-        BLEND_NONE => src,
-        m => {
-            let bm = BLEND_MODES.get(m as usize).and_then(|l| BlendMode::from_name(l)).unwrap_or(BlendMode::Normal);
-            blend_pixel(bm, orig, src, 0.5)
-        }
+        None => src,
+        Some(bm) => blend_pixel(bm, orig, src, 0.5),
     };
     let k = 1.0 - blend_orig;
     [0, 1, 2, 3].map(|c| orig[c] * blend_orig + out[c] * orig[3] * k)
@@ -447,7 +449,7 @@ pub(crate) fn composite(orig: [f32; 4], val: f32, opacity: f32, mode: u32, blend
 fn render(ctx: &EffectCtx, mut b: Buf, turbulent: bool) -> Buf {
     let fr = Fractal::from_params(ctx, &b, turbulent);
     let opacity = (ctx.params.f("opacity") as f32 / 100.0).clamp(0.0, 1.0);
-    let mode = ctx.params.get("blendingMode").map(Value::as_enum).unwrap_or(BLEND_NONE);
+    let mode = blend_mode(ctx.params.get("blendingMode").map(Value::as_enum).unwrap_or(BLEND_NONE));
     let blend = ctx.params.f("blend") as f32 / 100.0;
     b.img.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
@@ -664,5 +666,35 @@ mod tests {
             }
         }
         assert!(axis / diag < 1.15, "gradient along the axes / along the diagonals: {}", axis / diag);
+    }
+
+    /// The base composite, resolving the Blending Mode by name on every call, kept only to prove
+    /// the hoisted lookup changes nothing.
+    fn old_composite(orig: [f32; 4], val: f32, opacity: f32, mode: u32, blend_orig: f32) -> [f32; 4] {
+        let src = [val * opacity, val * opacity, val * opacity, opacity];
+        let out = match mode {
+            BLEND_NONE => src,
+            m => {
+                let bm = BLEND_MODES.get(m as usize).and_then(|l| BlendMode::from_name(l)).unwrap_or(BlendMode::Normal);
+                blend_pixel(bm, orig, src, 0.5)
+            }
+        };
+        let k = 1.0 - blend_orig;
+        [0, 1, 2, 3].map(|c| orig[c] * blend_orig + out[c] * orig[3] * k)
+    }
+
+    #[test]
+    fn resolved_blend_matches_per_pixel_lookup() {
+        for m in (0..BLEND_MODES.len() as u32).chain([24, 999]) {
+            for orig in [[0.2, 0.4, 0.6, 1.0], [0.9, 0.1, 0.5, 0.5], [0.0, 0.0, 0.0, 0.0]] {
+                for val in [0.0, 0.3, 0.75, 1.0] {
+                    for (op, bl) in [(1.0, 0.0), (0.6, 0.25)] {
+                        assert_eq!(composite(orig, val, op, blend_mode(m), bl), old_composite(orig, val, op, m, bl), "mode {m}");
+                    }
+                }
+            }
+        }
+        assert_eq!(blend_mode(BLEND_NONE), None);
+        assert_eq!(blend_mode(999), Some(BlendMode::Normal));
     }
 }
