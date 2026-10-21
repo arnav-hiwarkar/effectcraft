@@ -1528,6 +1528,12 @@ impl Project {
     }
     /// [`Project::to_file_json`] that also records the open compositions ([`SavedView`]).
     pub fn to_file_json_with_view(&self, view: &SavedView) -> Result<String, ProjectError> {
+        if self.schema > SCHEMA_VERSION {
+            return Err(ProjectError::Invalid(format!(
+                "the project can't be saved: it holds a value a project file can't store (project schema {} is newer than this version supports ({SCHEMA_VERSION}))",
+                self.schema
+            )));
+        }
         #[derive(Serialize)]
         struct File<'a> {
             #[serde(rename = "savedBy")]
