@@ -96,8 +96,8 @@ fn thumbnail(app: &EffectcraftApp, ctx: &egui::Context, path: &str, budget: &mut
                 None => app.session.footage.frame(ItemId(hid), &f, effectcraft_engine::time::Tick::ZERO)?,
             }
         };
-        if !app.session.footage_path_in_use(path) {
-            app.session.footage.release_decoder(path);
+        if !app.session.footage_path_in_use(&f.path) {
+            app.session.footage.release_decoder(&f.path);
         }
         let ([w, h], px) = thumb_pixels(&img)?;
         let tex = ctx.load_texture(format!("mb-{path}"), egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &px), egui::TextureOptions::LINEAR);
