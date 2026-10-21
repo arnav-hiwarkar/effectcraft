@@ -784,6 +784,82 @@ fn background_autosave_commits_only_the_snapshot_that_finished() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn render_checkpoint_failure_preserves_work_and_retry_checkpoints_before_export() {
+    struct SnapshotExporter {
+        store: Arc<AutosaveTestStore>,
+        inner: Arc<crate::rq_tests::MockExporter>,
+        opened: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+    impl crate::Exporter for SnapshotExporter {
+        fn formats(&self) -> Vec<effectcraft_project::render_queue::OutputFormat> {
+            self.inner.formats()
+        }
+        fn export(&self, job: &crate::ExportJob, progress: &mut dyn FnMut(u64, u64) -> bool) -> std::result::Result<crate::ExportResult, String> {
+            let sentinel = self.store.read(autosave::SENTINEL).ok_or("no recovery sentinel")?;
+            let sentinel: autosave::Sentinel = serde_json::from_str(&sentinel).map_err(|e| e.to_string())?;
+            let path = sentinel.autosave.ok_or("no recovery snapshot")?;
+            let mut opened = Session::default();
+            opened.execute("file.open", json!({"path": path})).map_err(|e| e.to_string())?;
+            let comp = opened.active_comp().ok_or("no active composition")?;
+            self.opened.lock().unwrap().push(comp.layers.iter().map(|l| l.name.clone()).collect());
+            self.inner.export(job, progress)
+        }
+    }
+
+    let dir = tmp("render-checkpoint");
+    let (mut s, store) = background_autosave_session(&dir);
+    s.prefs.auto_save.save_on_render_start = true;
+    let mock = Arc::new(crate::rq_tests::MockExporter { log: Default::default() });
+    let exporter = Arc::new(SnapshotExporter { store: store.clone(), inner: mock.clone(), opened: Default::default() });
+    s.exporter = Some(exporter.clone());
+    let original = dir.join("Original.ecproj");
+    s.execute("file.saveAs", json!({"path": original.to_string_lossy()})).unwrap();
+    let first = s.autosave_now().unwrap();
+    s.autosave_wait().unwrap();
+    s.execute("layer.newNull", json!({"name": "unsaved work"})).unwrap();
+    std::fs::create_dir_all(dir.join("render")).unwrap();
+    s.execute("renderQueue.add", json!({"output": dir.join("render/out.mp4").to_string_lossy()})).unwrap();
+
+    let original_bytes = std::fs::read(&original).unwrap();
+    let snapshot_bytes = std::fs::read(&first).unwrap();
+    let sentinel = store.read(autosave::SENTINEL).unwrap();
+    let prefs = s.prefs.clone();
+    let persisted_prefs = store.read(PREFS_FILE).unwrap();
+    let recovery = (s.autosave.last_path.clone(), s.autosave.last_slot, s.autosave.saved_revision);
+
+    store.fail_next.store(true, std::sync::atomic::Ordering::SeqCst);
+    let error = s.execute("renderQueue.render", json!({"wait": true})).unwrap_err().to_string();
+    assert!(error.contains("Render not started"), "{error}");
+    assert!(error.contains("injected autosave write failure"), "{error}");
+    assert!(error.contains("Check the auto-save folder"), "{error}");
+    assert!(mock.log.lock().unwrap().is_empty(), "no item is exported after a failed checkpoint");
+    assert!(s.render_job.is_none(), "no render job is created");
+    assert_eq!(s.project.render_queue[0].status.label(), "Queued");
+    assert!(s.is_dirty());
+    assert!(s.active_comp().unwrap().layers.iter().any(|l| l.name == "unsaved work"));
+    assert_eq!(std::fs::read(&original).unwrap(), original_bytes, "the saved project is untouched");
+    assert_eq!(std::fs::read(&first).unwrap(), snapshot_bytes, "the previous checkpoint is untouched");
+    assert_eq!(store.read(autosave::SENTINEL).unwrap(), sentinel, "recovery metadata still names the previous checkpoint");
+    assert_eq!((s.autosave.last_path.clone(), s.autosave.last_slot, s.autosave.saved_revision), recovery);
+    assert_eq!(s.prefs, prefs);
+    assert_eq!(store.read(PREFS_FILE).unwrap(), persisted_prefs, "preferences were not written again");
+
+    let result = s.execute("renderQueue.render", json!({"wait": true})).unwrap();
+    assert_eq!(result["items"].as_array().unwrap().len(), 1);
+    assert_eq!(*exporter.opened.lock().unwrap(), [vec!["unsaved work".to_string()]], "the checkpoint named by the sentinel holds the new layer before export");
+    assert_eq!(mock.log.lock().unwrap().len(), 1);
+    assert_eq!(s.project.render_queue[0].status.label(), "Done");
+    assert_eq!(std::fs::read(&original).unwrap(), original_bytes, "rendering does not write the saved project");
+    assert_eq!(s.prefs, prefs);
+    assert_eq!(store.read(PREFS_FILE).unwrap(), persisted_prefs);
+    let mut reopened = Session::default();
+    reopened.execute("file.open", json!({"path": s.autosave.last_path.clone().unwrap()})).unwrap();
+    assert!(reopened.active_comp().unwrap().layers.iter().any(|l| l.name == "unsaved work"));
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 fn autosave_project_transition_with_failed_reset(command: &str, reopen: bool) {
     let dir = tmp("autosave-project-transition");
     let a = dir.join("A.ecproj").to_string_lossy().into_owned();
