@@ -217,8 +217,9 @@ impl<'a> Serializer for &'a mut Walker {
     fn serialize_str(self, _v: &str) -> Result<(), Unstorable> {
         Ok(())
     }
+    /// serde_json writes bytes as an array of numbers: one level of nesting.
     fn serialize_bytes(self, _v: &[u8]) -> Result<(), Unstorable> {
-        Ok(())
+        Compound::new(self, 1)?.finish()
     }
     /// Writes text for a `Display` value; it is a scalar, not a container.
     fn collect_str<T: fmt::Display + ?Sized>(self, _v: &T) -> Result<(), Unstorable> {
@@ -298,6 +299,31 @@ mod tests {
             let reads_back = serde_json::from_str::<serde_json::Value>(&text).is_ok();
             assert_eq!(check(&v).is_ok(), reads_back, "depth {n} agrees with serde_json");
             assert_eq!(check(&v).is_ok(), n == 127, "depth {n}");
+        }
+    }
+
+    /// `n` nested lists around bytes, which serde_json writes as one more array.
+    struct BytesUnder(u32);
+
+    impl serde::Serialize for BytesUnder {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeSeq;
+            let Some(inner) = self.0.checked_sub(1) else {
+                return s.serialize_bytes(&[1]);
+            };
+            let mut seq = s.serialize_seq(Some(1))?;
+            seq.serialize_element(&BytesUnder(inner))?;
+            seq.end()
+        }
+    }
+
+    #[test]
+    fn bytes_count_as_one_level() {
+        for n in [126, 127] {
+            let text = serde_json::to_string(&BytesUnder(n)).unwrap();
+            let reads_back = serde_json::from_str::<serde_json::Value>(&text).is_ok();
+            assert_eq!(check(&BytesUnder(n)).is_ok(), reads_back, "depth {n} agrees with serde_json");
+            assert_eq!(check(&BytesUnder(n)).is_ok(), n == 126, "depth {n}");
         }
     }
 }
