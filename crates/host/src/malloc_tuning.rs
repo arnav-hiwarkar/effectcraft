@@ -40,13 +40,13 @@ pub fn reexec() -> std::io::Result<()> {
         return Ok(());
     }
     let mut args = std::env::args_os();
-    let (mut cmd, _) = reexec_command(args.next(), args, value);
+    let mut cmd = reexec_command(args.next(), args, value);
     // std may reset SIGPIPE if exec itself fails. The checked procfs target avoids the ordinary
     // missing or inaccessible executable failures that made that state change reachable.
     Err(cmd.exec())
 }
 
-fn reexec_command(argv0: Option<OsString>, args: impl IntoIterator<Item = OsString>, value: String) -> (std::process::Command, Option<OsString>) {
+fn reexec_command(argv0: Option<OsString>, args: impl IntoIterator<Item = OsString>, value: String) -> std::process::Command {
     use std::os::unix::process::CommandExt;
 
     let mut command = std::process::Command::new("/proc/self/exe");
@@ -54,7 +54,7 @@ fn reexec_command(argv0: Option<OsString>, args: impl IntoIterator<Item = OsStri
         command.arg0(original_argv0);
     }
     command.args(args).env(TUNABLES, value).env(MARKER, "1");
-    (command, argv0)
+    command
 }
 
 #[cfg(test)]
@@ -97,9 +97,11 @@ mod tests {
     #[test]
     fn command_uses_proc_self_exe_and_preserves_argv0() {
         let original_argv0 = OsString::from("/custom/effectcraft");
-        let (command, argv0) = reexec_command(Some(original_argv0.clone()), [OsString::from("--version")], "glibc.malloc.hugetlb=1".into());
+        let command = reexec_command(Some(original_argv0.clone()), [OsString::from("--version")], "glibc.malloc.hugetlb=1".into());
 
         assert_eq!(command.get_program(), OsStr::new("/proc/self/exe"));
-        assert_eq!(argv0, Some(original_argv0));
+        let debug = format!("{command:?}");
+        assert!(debug.contains(original_argv0.to_str().unwrap_or_default()));
+        assert!(debug.contains("/proc/self/exe"));
     }
 }
