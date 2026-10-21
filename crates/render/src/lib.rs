@@ -1094,9 +1094,10 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// Only the CPU compositor reaches [`Self::draw_comp`] (whatever the backend asked for), so
+    /// the backend needs no check here.
     fn covers_frame(&self, ctx: &EvalCtx<'a>, layer: &Layer) -> bool {
         if !self.top
-            || self.opts.backend != Backend::Cpu
             || self.opts.scale != 1.0
             || self.opts.roi.is_some()
             || self.outer.is_some()
