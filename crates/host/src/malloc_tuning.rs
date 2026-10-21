@@ -2,6 +2,7 @@
 //! Set `EFFECTCRAFT_NO_MALLOC_TUNING` to any non-empty value to opt out.
 
 use std::ffi::OsStr;
+use std::ffi::OsString;
 
 const TUNABLES: &str = "GLIBC_TUNABLES";
 const HUGETLB: &str = "glibc.malloc.hugetlb=1";
@@ -35,19 +36,31 @@ pub fn reexec() -> std::io::Result<()> {
     let Some(value) = tunables(std::env::var_os(TUNABLES).as_deref(), std::env::var_os(OPT_OUT).as_deref(), std::env::var_os(MARKER).as_deref()) else {
         return Ok(());
     };
-    let exe = std::env::current_exe()?;
-    let mut args = std::env::args_os();
-    let mut cmd = std::process::Command::new(exe);
-    if let Some(argv0) = args.next() {
-        cmd.arg0(argv0);
+    if std::fs::read_link("/proc/self/exe").is_err() {
+        return Ok(());
     }
-    Err(cmd.args(args).env(TUNABLES, value).env(MARKER, "1").exec())
+    let mut args = std::env::args_os();
+    let (mut cmd, _) = reexec_command(args.next(), args, value);
+    // std may reset SIGPIPE if exec itself fails. The checked procfs target avoids the ordinary
+    // missing or inaccessible executable failures that made that state change reachable.
+    Err(cmd.exec())
+}
+
+fn reexec_command(argv0: Option<OsString>, args: impl IntoIterator<Item = OsString>, value: String) -> (std::process::Command, Option<OsString>) {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = std::process::Command::new("/proc/self/exe");
+    if let Some(original_argv0) = argv0.as_ref() {
+        command.arg0(original_argv0);
+    }
+    command.args(args).env(TUNABLES, value).env(MARKER, "1");
+    (command, argv0)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::tunables;
-    use std::ffi::OsStr;
+    use super::{reexec_command, tunables};
+    use std::ffi::{OsStr, OsString};
 
     fn s(value: &str) -> Option<&OsStr> {
         Some(OsStr::new(value))
@@ -79,5 +92,14 @@ mod tests {
     #[test]
     fn reexeced_skips() {
         assert_eq!(tunables(None, None, s("1")), None);
+    }
+
+    #[test]
+    fn command_uses_proc_self_exe_and_preserves_argv0() {
+        let original_argv0 = OsString::from("/custom/effectcraft");
+        let (command, argv0) = reexec_command(Some(original_argv0.clone()), [OsString::from("--version")], "glibc.malloc.hugetlb=1".into());
+
+        assert_eq!(command.get_program(), OsStr::new("/proc/self/exe"));
+        assert_eq!(argv0, Some(original_argv0));
     }
 }
