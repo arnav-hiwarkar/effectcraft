@@ -152,6 +152,8 @@ struct Cache {
     gpu_budget: usize,
     /// The playing preview, if any: evictions spare the frames it shows next.
     playhead: Option<Playhead>,
+    /// Scale of the newest frame request: frames of other scales are evicted first.
+    scale: Option<u32>,
 }
 
 impl Cache {
@@ -173,8 +175,14 @@ impl Cache {
     /// recently shown of the frames it doesn't reach, then the one it reaches last. Plain LRU
     /// evicted the frames just ahead of the playhead first (rendered a while ago, not shown yet)
     /// to keep the ones just shown, so a preview longer than the cache played into a gap that
-    /// prefetch kept refilling while it evicted the next frames (#595).
+    /// prefetch kept refilling while it evicted the next frames (#595). Frames of another scale
+    /// than the newest request go first (a zoom or resolution change).
     fn victim(&self) -> Option<usize> {
+        if let Some(s) = self.scale
+            && let Some(i) = self.order.iter().position(|k| k.scale != s)
+        {
+            return Some(i);
+        }
         let Some(p) = &self.playhead else { return (!self.order.is_empty()).then_some(0) };
         let mut farthest: Option<(i64, usize)> = None;
         for (i, k) in self.order.iter().enumerate() {
@@ -186,10 +194,13 @@ impl Cache {
         }
         farthest.map(|(_, i)| i)
     }
-    /// Video memory: drop the oldest GPU frames past their own budget.
+    /// Video memory: drop the oldest GPU frames past their own budget, frames of another scale
+    /// than the newest request first (a zoom or resolution change).
     fn evict_gpu(&mut self) {
         while self.gpu_bytes > self.gpu_budget {
-            let Some(i) = self.order.iter().position(|k| self.map.get(k).is_some_and(FrameImage::is_gpu)) else { break };
+            let is_gpu = |k: &FrameKey| self.map.get(k).is_some_and(FrameImage::is_gpu);
+            let other_scale = self.order.iter().position(|k| Some(k.scale) != self.scale && is_gpu(k));
+            let Some(i) = other_scale.or_else(|| self.order.iter().position(is_gpu)) else { break };
             if let Some(old) = self.order.remove(i) {
                 self.remove(&old);
             }
@@ -462,7 +473,7 @@ impl Default for Frames {
         #[cfg(not(target_arch = "wasm32"))]
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16);
         Frames {
-            cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET, playhead: None })),
+            cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET, playhead: None, scale: None })),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             queue: Arc::new(Mutex::new(Queue::default())),
             #[cfg(not(target_arch = "wasm32"))]
@@ -893,7 +904,15 @@ impl Frames {
     }
 
     fn request_with(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts, urgent: bool) {
-        if self.is_cached(&key) {
+        let cached = self
+            .cache
+            .lock()
+            .map(|mut c| {
+                c.scale = Some(key.scale);
+                c.map.contains_key(&key)
+            })
+            .unwrap_or(false);
+        if cached {
             return;
         }
         let Ok(mut q) = self.queue.lock() else { return };
@@ -1795,21 +1814,17 @@ mod tests {
         assert!(!f.is_cached(&key(1, 13, 0)) && f.is_cached(&key(1, 50, 0)));
     }
 
-    /// #595: prefetch renders the frames the preview reaches first, whatever order they were
-    /// asked for in (a frame evicted and asked for again waited behind every frame further
-    /// ahead); queued frames the preview no longer reaches are dropped and not left in flight.
-    #[test]
-    fn prefetch_renders_the_frames_the_playhead_reaches_first() {
-        struct Idle;
-        impl RemoteFrames for Idle {
-            fn slots(&self) -> usize {
-                0
-            }
-            fn start(&self, _: RemoteJob, _: RemoteDone) {}
+    /// A frame source that queues jobs and never renders them: the tests check the queue.
+    struct Idle;
+    impl RemoteFrames for Idle {
+        fn slots(&self) -> usize {
+            0
         }
-        let mut f = Frames::default();
-        f.set_remote(Some(Arc::new(Idle)));
-        let src = RenderSource {
+        fn start(&self, _: RemoteJob, _: RemoteDone) {}
+    }
+
+    fn idle_source() -> RenderSource {
+        RenderSource {
             project: Arc::default(),
             footage: Arc::new(effectcraft_engine::render::NoFootage),
             expr: None,
@@ -1817,7 +1832,17 @@ mod tests {
             gpu: None,
             gpu_display: false,
             disk: None,
-        };
+        }
+    }
+
+    /// #595: prefetch renders the frames the preview reaches first, whatever order they were
+    /// asked for in (a frame evicted and asked for again waited behind every frame further
+    /// ahead); queued frames the preview no longer reaches are dropped and not left in flight.
+    #[test]
+    fn prefetch_renders_the_frames_the_playhead_reaches_first() {
+        let mut f = Frames::default();
+        f.set_remote(Some(Arc::new(Idle)));
+        let src = idle_source();
         for frame in [40, 30, 20, 5, 12, 11] {
             f.request(&src, key(1, frame, 0), ItemId(1), Tick::ZERO, RenderOpts::default());
         }
@@ -1832,6 +1857,35 @@ mod tests {
         }
         assert_eq!(order, [(1, 11), (1, 12), (1, 20), (1, 30), (1, 40), (2, 1)]);
         assert_eq!(f.inflight(), 6, "frame 5, behind the playhead, is no longer in flight");
+    }
+
+    /// I-16: the cache is full. A zoom (or preview-resolution) change left the frames of the old
+    /// size to the plain least-recently-shown order, so the frames of the zoom the viewer is back
+    /// at went before the ones of the abandoned zoom. The other size's frames go first, then the
+    /// order is as before.
+    #[test]
+    fn a_size_change_evicts_frames_of_other_sizes_first() {
+        let mut f = Frames::default();
+        f.set_remote(Some(Arc::new(Idle)));
+        f.set_budget(4 * 16);
+        let at = |frame, scale| FrameKey { scale, ..key(1, frame, 0) };
+        // 100% (frames 0..=1) is cached, then 50% (2..=3): the 100% frames are the oldest.
+        for (frame, scale) in [(0, 1000), (1, 1000), (2, 500), (3, 500)] {
+            insert(&f, at(frame, scale));
+        }
+        // Back at 100%: the viewer asks for frame 4.
+        f.request(&idle_source(), at(4, 1000), ItemId(1), Tick::ZERO, RenderOpts::default());
+        insert(&f, at(4, 1000));
+        assert!(
+            f.is_cached(&at(0, 1000)) && f.is_cached(&at(1, 1000)) && !f.is_cached(&at(2, 500)) && f.is_cached(&at(3, 500)),
+            "the first frame of the old size goes, not the cached ones of the current size"
+        );
+        insert(&f, at(5, 1000));
+        assert!(!f.is_cached(&at(3, 500)), "then the last frame of the old size");
+        assert_eq!(f.cached_frames(&at(0, 1000)), [0, 1, 4, 5]);
+        // No other size left: least recently shown first again.
+        insert(&f, at(6, 1000));
+        assert_eq!(f.cached_frames(&at(0, 1000)), [1, 4, 5, 6]);
     }
 
     #[test]
