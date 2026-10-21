@@ -31,6 +31,50 @@ fn solid_fills_comp() {
 }
 
 #[test]
+fn occlusion_skips_hidden_source() {
+    for depth in [effectcraft_project::BitDepth::Bpc8, effectcraft_project::BitDepth::Bpc16] {
+        for scale in [100.0, 200.0] {
+            let (mut p, cid, comp) = setup();
+            p.settings.bit_depth = depth;
+            let bottom = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+            let top = solid(&mut p, &comp, [0.0, 1.0, 0.0], 200, 100);
+            let mut top = top;
+            let tr = top.transform_mut().unwrap();
+            tr.get_mut("scale").unwrap().value = Value::Vec3([scale; 3]);
+            let comp_mut = p.comp_mut(cid).unwrap();
+            comp_mut.layers.push(bottom);
+            comp_mut.layers.push(top);
+            let image = render_frame(&p, cid, Tick::ZERO, 1.0);
+            assert_eq!(image.get(0, 0), [0.0, 1.0, 0.0, 1.0]);
+            assert_eq!(image.get(199, 99), [0.0, 1.0, 0.0, 1.0]);
+        }
+    }
+}
+
+#[test]
+fn occlusion_fallbacks() {
+    let (mut p, cid, comp) = setup();
+    p.settings.bit_depth = effectcraft_project::BitDepth::Bpc8;
+    let mut layer = solid(&mut p, &comp, [0.0, 1.0, 0.0], 200, 100);
+    let renderer = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default());
+    let ctx = renderer.eval_ctx(cid, Tick::ZERO).unwrap();
+    assert!(renderer.covers_frame(&ctx, &layer));
+
+    layer.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(99.0);
+    assert!(!renderer.covers_frame(&ctx, &layer));
+    layer.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(100.0);
+    layer.props.prop_mut("transform/rotation").unwrap().value = Value::Scalar(1.0);
+    assert!(!renderer.covers_frame(&ctx, &layer));
+    layer.props.prop_mut("transform/rotation").unwrap().value = Value::Scalar(0.0);
+    drop(ctx);
+    drop(renderer);
+    p.settings.bit_depth = effectcraft_project::BitDepth::Bpc32;
+    let renderer = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default());
+    let ctx = renderer.eval_ctx(cid, Tick::ZERO).unwrap();
+    assert!(!renderer.covers_frame(&ctx, &layer));
+}
+
+#[test]
 fn position_keyframes_move_layer() {
     let (mut p, cid, comp) = setup();
     let mut l = solid(&mut p, &comp, [0.0, 1.0, 0.0], 20, 20);
