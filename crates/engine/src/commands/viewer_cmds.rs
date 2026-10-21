@@ -88,7 +88,7 @@ impl Default for ViewOptions {
             colorized: false,
             exposure: 0.0,
             show_snapshot: false,
-            fast_previews: FastPreviews::default(),
+            fast_previews: FastPreviews::AdaptiveResolution,
             display_color_management: true,
             simulation: Simulation::default(),
             custom_simulation: Simulation { profile: SimProfile::Linear, preserve_rgb: true },
