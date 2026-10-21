@@ -99,6 +99,9 @@ pub trait FootageSource: Send + Sync {
     /// frames, open decoders, parsed models), so the next reads see the new contents. Sources
     /// without a cache ignore it.
     fn forget(&self, _path: &str) {}
+    /// Close the open decoder of the file at `path` (its threads and buffers) but keep its decoded
+    /// frames: a read the frame cache can't answer opens it again. Sources without decoders ignore it.
+    fn release_decoder(&self, _path: &str) {}
     /// Settings ▸ Disk ▸ Conformed Audio Folder: where decoded audio is kept between reads
     /// (`None` = off); sources that don't decode audio ignore it.
     fn set_conform_folder(&self, _folder: Option<std::path::PathBuf>) {}
@@ -176,6 +179,9 @@ impl FootageSource for CancellableFootage<'_> {
     }
     fn forget(&self, path: &str) {
         self.inner.forget(path)
+    }
+    fn release_decoder(&self, path: &str) {
+        self.inner.release_decoder(path)
     }
     fn set_conform_folder(&self, folder: Option<std::path::PathBuf>) {
         self.inner.set_conform_folder(folder)

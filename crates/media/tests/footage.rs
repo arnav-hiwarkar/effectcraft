@@ -1078,3 +1078,21 @@ fn an_unsupported_stream_reports_why_it_shows_no_picture() {
     pool.forget(&f.path);
     assert_eq!(pool.problem(&f), None);
 }
+
+/// #8: releasing a thumbnail-only clip's decoder frees its threads and buffers, but its decoded
+/// frames stay: a re-thumbnail is a cache hit, and only an uncached frame reopens it.
+#[test]
+fn release_decoder_closes_the_movie_but_keeps_its_frames() {
+    let Some(p) = h264_mp4() else { return };
+    let f = probe(&p).expect("probe");
+    let pool = MediaPool::new();
+    assert!(pool.frame_at(&f, Tick::ZERO).is_ok(), "first frame");
+    assert_eq!(pool.stats().opened, 1);
+    let hits = pool.stats().hits;
+    pool.release_decoder(&f.path);
+    assert!(pool.frame_at(&f, Tick::ZERO).is_ok(), "cached first frame");
+    assert_eq!(pool.stats().opened, 1, "the cached frame needed no decoder");
+    assert!(pool.stats().hits > hits, "it came from the cache");
+    assert!(pool.frame_at(&f, t_of(f.frame_rate, 5)).is_ok(), "an uncached frame");
+    assert_eq!(pool.stats().opened, 2, "the released decoder was opened again");
+}

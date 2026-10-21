@@ -1063,6 +1063,18 @@ impl Session {
         Ok((img.width, img.height, img.to_rgba8_over(c.background)))
     }
 
+    /// Whether a layer in any comp shows footage read from `path` (its decoder stays open).
+    pub fn footage_path_in_use(&self, path: &str) -> bool {
+        self.project.comps().any(|(_, c)| {
+            c.layers.iter().any(|l| {
+                l.source
+                    .item()
+                    .and_then(|i| self.project.item(i))
+                    .is_some_and(|it| matches!(&it.kind, effectcraft_project::ItemKind::Footage(f) if f.path == path))
+            })
+        })
+    }
+
     /// A Project panel thumbnail of an item (a comp at `t`, footage at its first frame), longest
     /// side at most `max_side`, as a job that owns everything it reads: frontends run it off the
     /// UI thread (a big comp takes far longer than a frame). `None` for items without pixels.
@@ -1090,9 +1102,13 @@ impl Session {
                 }))
             }
             effectcraft_project::ItemKind::Footage(f) if f.has_video => {
+                let release = !self.footage_path_in_use(&f.path);
                 let f = f.clone();
                 Some(Box::new(move || {
                     let img = footage.frame(item, &f, Tick(0))?;
+                    if release {
+                        footage.release_decoder(&f.path);
+                    }
                     // Point-sample down to at most `max_side` on the long side.
                     let step = (img.width.max(img.height) as f32 / max_side.max(1) as f32).ceil().max(1.0) as u32;
                     let (w, h) = (img.width.div_ceil(step), img.height.div_ceil(step));
@@ -1307,6 +1323,8 @@ mod tests_tail;
 mod tests_text;
 #[cfg(test)]
 mod tests_text_edit;
+#[cfg(test)]
+mod tests_thumbnail_release;
 #[cfg(test)]
 mod tests_timeline;
 #[cfg(test)]
