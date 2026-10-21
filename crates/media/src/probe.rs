@@ -462,7 +462,7 @@ mod tests {
         let disk = probe(&path).expect("probe disk");
         std::fs::remove_file(&path).expect("remove");
         assert_eq!(disk.kind, FootageKind::Video);
-        assert_eq!(disk.frame_rate, FrameRate::FPS_30);
+        assert_eq!(disk.frame_rate, FrameRate::new(30_303, 1_000));
         assert_eq!((disk.width, disk.height), (8, 16));
         assert_eq!(disk.pixel_aspect, 1.0);
     }
