@@ -81,6 +81,9 @@ pub trait Accelerator: Send + Sync {
     fn auto_pick(&self) -> Option<&AutoPick> {
         None
     }
+    fn is_software(&self) -> bool {
+        false
+    }
     /// Whether the accelerator can still render frames. `false` once it has stopped for good
     /// (its device was lost or retired): every frame it is asked for falls back to the CPU, so
     /// callers that limit frames in flight for it can stop doing so.

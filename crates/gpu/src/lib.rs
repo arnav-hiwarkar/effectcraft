@@ -354,6 +354,10 @@ impl Accelerator for Gpu {
         self.ctx.check_health().is_ok()
     }
 
+    fn is_software(&self) -> bool {
+        self.ctx.software_export
+    }
+
     fn comp_frame(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<Image> {
         let img = self.render(r, comp, t);
         if img.is_none() {
