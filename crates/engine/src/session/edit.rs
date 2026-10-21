@@ -241,9 +241,9 @@ impl Session {
         self.script_ui.project_epoch = self.script_ui.project_epoch.wrapping_add(1);
         p.fix_next_id();
         upgrade_effects(&mut p);
-        // The media layer keys decoded frames by path: files of the new project may have changed
-        // since an earlier project decoded them (#1070).
-        for it in p.items.values() {
+        // Release the old project and forget cached paths in the new project, whose files may
+        // have changed since an earlier project decoded them (#1070).
+        for it in self.project.items.values().chain(p.items.values()) {
             if let effectcraft_project::ItemKind::Footage(f) = &it.kind {
                 self.forget_decoded(f);
             }
@@ -257,6 +257,7 @@ impl Session {
         self.path = path;
         self.bump();
         self.mark_saved();
+        self.events.push(Event::PurgeCaches);
         let first = self.project.comps().next().map(|(id, _)| *id);
         if let Some(c) = first {
             self.open_comp(c);
