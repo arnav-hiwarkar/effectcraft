@@ -758,7 +758,12 @@ impl Frames {
     /// Frames of the series of `base` in the disk cache but not in RAM — the blue cache bar.
     /// `opts` are the viewer's render options (part of the disk key). Native queries return
     /// no blue frames until the content key is ready; hashing never blocks timeline painting.
-    pub fn disk_frames(&self, src: &RenderSource, base: &FrameKey, frames: i64, opts: &RenderOpts) -> Vec<i64> {
+    pub fn disk_frames(&self, src: &RenderSource, base: &FrameKey, range: std::ops::Range<i64>, opts: &RenderOpts) -> Vec<i64> {
+        let start = range.start.clamp(0, 100_000);
+        let end = range.end.clamp(0, 100_000);
+        if start >= end {
+            return vec![];
+        }
         let remote = self.remote.as_ref().filter(|r| r.disk());
         let contains = |k: u128| match (&src.disk, remote) {
             (Some(dc), _) => dc.contains(disk_cache::Kind::Frame, k),
@@ -781,10 +786,7 @@ impl Frames {
         let content = content_key(&self.content_keys, &src.project, base.revision, base.comp);
         let ram: HashSet<i64> = self.cached_frames(base).into_iter().collect();
         let oh = opts_hash(opts);
-        (0..frames.clamp(0, 100_000))
-            .filter(|f| !ram.contains(f))
-            .filter(|f| contains(disk_cache::frame_key(content, *f, base.scale, base.view ^ oh)))
-            .collect()
+        (start..end).filter(|f| !ram.contains(f)).filter(|f| contains(disk_cache::frame_key(content, *f, base.scale, base.view ^ oh))).collect()
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1375,6 +1377,54 @@ impl Queue {
 mod tests {
     use super::*;
 
+    struct ProbeDisk {
+        keys: Mutex<HashSet<u128>>,
+        probes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RemoteFrames for ProbeDisk {
+        fn slots(&self) -> usize {
+            0
+        }
+
+        fn disk(&self) -> bool {
+            true
+        }
+
+        fn disk_contains(&self, key: u128) -> bool {
+            self.probes.fetch_add(1, Ordering::Relaxed);
+            self.keys.lock().unwrap().contains(&key)
+        }
+
+        fn start(&self, _: RemoteJob, _: RemoteDone) {}
+    }
+
+    fn disk_fixture(stored_frames: &[i64]) -> (Frames, RenderSource, FrameKey, RenderOpts, Arc<ProbeDisk>, u128) {
+        let mut session = effectcraft_engine::Session::default();
+        session.execute("comp.new", serde_json::json!({"width": 32, "height": 18, "duration": 1})).unwrap();
+        let comp = session.active_comp_id().unwrap();
+        let opts = RenderOpts::default();
+        let content = 1234;
+        let mut base = key(1, 0, opts_hash(&opts));
+        base.revision = 7;
+        base.comp = comp.0;
+        let disk = Arc::new(ProbeDisk { keys: Mutex::new(HashSet::new()), probes: 0.into() });
+        disk.keys.lock().unwrap().extend(stored_frames.iter().map(|frame| disk_cache::frame_key(content, *frame, base.scale, base.view ^ opts_hash(&opts))));
+        let mut frames = Frames::default();
+        frames.set_remote(Some(disk.clone()));
+        frames.content_keys.lock().unwrap().insert((base.revision, base.comp), content);
+        let source = RenderSource {
+            project: session.project.clone(),
+            footage: session.footage.clone(),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        (frames, source, base, opts, disk, content)
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn disk_indicator_does_not_hash_on_ui_thread_and_coalesces_edits() {
@@ -1422,7 +1472,7 @@ mod tests {
         base.comp = cid.0;
         for revision in 1..50 {
             base.revision = revision;
-            assert!(frames.disk_frames(&src, &base, 30, &opts).is_empty());
+            assert!(frames.disk_frames(&src, &base, 0..30, &opts).is_empty());
         }
         assert!(frames.content_keys.lock().unwrap().is_empty(), "painting computed a content hash while the worker was blocked");
         assert_eq!(frames.content_key_jobs.lock().unwrap().pending.len(), 1);
@@ -1432,8 +1482,51 @@ mod tests {
             assert!(Instant::now() < until);
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(frames.disk_frames(&src, &base, 30, &opts), vec![2], "the blue indicator must return once its key is ready");
+        assert_eq!(frames.disk_frames(&src, &base, 0..30, &opts), vec![2], "the blue indicator must return once its key is ready");
         assert_eq!(frames.content_keys.lock().unwrap().len(), 1, "superseded revisions were hashed");
+    }
+
+    #[test]
+    fn disk_indicator_range_tracks_live_membership() {
+        let (frames, src, base, opts, disk, _) = disk_fixture(&[10, 12]);
+        assert_eq!(frames.disk_frames(&src, &base, 10..13, &opts), vec![10, 12]);
+        assert_eq!(disk.probes.load(Ordering::Relaxed), 3);
+
+        disk.keys.lock().unwrap().insert(disk_cache::frame_key(1234, 11, base.scale, base.view ^ opts_hash(&opts)));
+        assert_eq!(frames.disk_frames(&src, &base, 10..13, &opts), vec![10, 11, 12]);
+
+        insert(&frames, FrameKey { frame: 11, ..base });
+        disk.probes.store(0, Ordering::Relaxed);
+        assert_eq!(frames.disk_frames(&src, &base, 10..13, &opts), vec![10, 12]);
+        assert_eq!(disk.probes.load(Ordering::Relaxed), 2);
+
+        disk.keys.lock().unwrap().remove(&disk_cache::frame_key(1234, 12, base.scale, base.view ^ opts_hash(&opts)));
+        assert_eq!(frames.disk_frames(&src, &base, 10..13, &opts), vec![10]);
+
+        let mut revised = base;
+        revised.revision += 1;
+        frames.content_keys.lock().unwrap().insert((revised.revision, revised.comp), 5678);
+        assert!(frames.disk_frames(&src, &revised, 10..13, &opts).is_empty());
+
+        let changed = FrameKey { scale: base.scale + 1, ..base };
+        assert!(frames.disk_frames(&src, &changed, 10..13, &opts).is_empty());
+        let changed = FrameKey { view: base.view + 1, ..base };
+        assert!(frames.disk_frames(&src, &changed, 10..13, &opts).is_empty());
+        assert!(frames.disk_frames(&src, &base, 10..13, &RenderOpts { draft: true, ..opts }).is_empty());
+    }
+
+    #[test]
+    fn disk_indicator_range_is_bounded() {
+        let (frames, src, base, opts, disk, _) = disk_fixture(&[0, 1, 99_999]);
+        assert_eq!(frames.disk_frames(&src, &base, -5..2, &opts), vec![0, 1]);
+        assert_eq!(disk.probes.load(Ordering::Relaxed), 2);
+        disk.probes.store(0, Ordering::Relaxed);
+        assert_eq!(frames.disk_frames(&src, &base, 99_999..i64::MAX, &opts), vec![99_999]);
+        assert_eq!(disk.probes.load(Ordering::Relaxed), 1);
+        disk.probes.store(0, Ordering::Relaxed);
+        assert!(frames.disk_frames(&src, &base, 2..2, &opts).is_empty());
+        assert!(frames.disk_frames(&src, &base, 3..2, &opts).is_empty());
+        assert_eq!(disk.probes.load(Ordering::Relaxed), 0);
     }
 
     /// Frames larger than the texture limit are averaged down by a whole factor (#201: an

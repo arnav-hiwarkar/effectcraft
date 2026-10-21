@@ -515,6 +515,19 @@ impl TMap {
     }
 }
 
+fn disk_bar_range(tm: &TMap, clip: Rect, fd: f64, frames: i64) -> std::ops::Range<i64> {
+    if clip.width() <= 0.0 || clip.height() <= 0.0 || !fd.is_finite() || fd <= 0.0 || !tm.pps.is_finite() || tm.pps <= 0.0 {
+        return 0..0;
+    }
+    let start = tm.t(clip.min.x) / fd;
+    let end = tm.t(clip.max.x) / fd;
+    if !start.is_finite() || !end.is_finite() {
+        return 0..0;
+    }
+    let limit = frames.clamp(0, 100_000) as f64;
+    (start.clamp(0.0, limit).floor() as i64)..(end.clamp(0.0, limit).ceil() as i64)
+}
+
 /// A Timeline ruler tick label for comp frame `fno`: seconds:frames (`00:15f`, AE) or, when
 /// the project's Time Display Style is Frames, the frame number the current-time display shows
 /// (`00015`, counted from Start Numbering Frames At) (#710).
@@ -1674,11 +1687,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if app.session.disk_cache.is_some() || app.frames.remote_disk() {
         let frames = comp.frame_rate.frame_at(comp.duration);
         let opts = app.frame_opts(cid, series.scale as f64 / 1000.0);
-        let disk = app.frames.disk_frames(&app.render_source(), &series, frames, &opts);
+        let clip = wa_row.intersect(p.clip_rect());
+        let range = disk_bar_range(&tm, clip, fd, frames);
+        let disk = app.frames.disk_frames(&app.render_source(), &series, range, &opts);
+        let blue_painter = p.with_clip_rect(clip);
         let draw_blue = |a: i64, b: i64| {
             let x0 = tm.x(a as f64 * fd);
             let x1 = tm.x((b + 1) as f64 * fd);
-            p.rect_filled(Rect::from_min_max(pos2(x0, cy0), pos2(x1, cy0 + 2.5)), 0.0, t.cache_blue);
+            blue_painter.rect_filled(Rect::from_min_max(pos2(x0, cy0), pos2(x1, cy0 + 2.5)), 0.0, t.cache_blue);
         };
         let mut run: Option<(i64, i64)> = None;
         for f in disk {
@@ -4719,5 +4735,23 @@ mod tests {
         assert!(bar.r() < red.r() && bar.r() > bar.g() + 30 && bar.g() >= red.g().min(0x3a) - 1);
         let sel = bar_color(red, true);
         assert!(sel.r() > bar.r());
+    }
+
+    #[test]
+    fn disk_bar_range_covers_partial_frames() {
+        let clip = Rect::from_min_max(pos2(0.0, 0.0), pos2(2.0, 1.0));
+        let tm = TMap { x0: 0.0, start: 10.25, pps: 1.0 };
+        assert_eq!(disk_bar_range(&tm, clip, 1.0, 100), 10..13);
+
+        let exact = TMap { start: 10.0, ..tm };
+        assert_eq!(disk_bar_range(&exact, clip, 1.0, 100), 10..12);
+        let off_comp = TMap { start: 200.0, ..tm };
+        assert_eq!(disk_bar_range(&off_comp, clip, 1.0, 100), 100..100);
+        assert_eq!(disk_bar_range(&tm, clip, f64::NAN, 100), 0..0);
+        assert_eq!(disk_bar_range(&TMap { pps: 0.0, ..tm }, clip, 1.0, 100), 0..0);
+        assert_eq!(disk_bar_range(&TMap { start: f64::NAN, ..tm }, clip, 1.0, 100), 0..0);
+        assert_eq!(disk_bar_range(&tm, Rect::from_min_max(pos2(2.0, 0.0), pos2(2.0, 1.0)), 1.0, 100), 0..0);
+        let above_limit = TMap { start: 100_001.0, ..tm };
+        assert_eq!(disk_bar_range(&above_limit, clip, 1.0, i64::MAX), 100_000..100_000);
     }
 }
