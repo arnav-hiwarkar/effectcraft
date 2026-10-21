@@ -105,7 +105,7 @@ fn harness(footage: Arc<RecordingFootage>) -> Harness<'static, EffectcraftApp> {
 
 /// The thumbnail the Media Browser cached for `path` (its size in pixels).
 fn thumb_size(h: &Harness<'_, EffectcraftApp>, path: &str) -> Option<[u32; 2]> {
-    h.ctx.data(|d| d.get_temp::<Thumb>(egui::Id::new(("mb-thumb", path)))).and_then(|t| t).map(|(_tex, size)| size)
+    h.ctx.data(|d| d.get_temp::<Thumb>(egui::Id::unique(("mb-thumb", path)))).and_then(|t| t).map(|(_tex, size)| size)
 }
 
 #[test]

@@ -53,6 +53,7 @@ mod tail;
 mod text;
 mod text_edit;
 mod three_d;
+mod thumbnail_release;
 mod timeline;
 mod timeline_interchange;
 pub(crate) mod track;
