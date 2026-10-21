@@ -276,6 +276,8 @@ fn utf8_args(raw: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Vec<St
 }
 
 fn main() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    let _ = effectcraft_host::malloc_tuning::reexec();
     let raw = match utf8_args(std::env::args_os().skip(1)) {
         Ok(raw) => raw,
         Err(e) => fail_usage(&e),
