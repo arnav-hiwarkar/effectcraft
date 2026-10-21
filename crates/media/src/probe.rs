@@ -427,7 +427,7 @@ mod tests {
         assert_eq!(video_rate(&file), Some(FrameRate::FPS_30));
 
         let mut durations = rounded(FrameRate::FPS_60, 1000, 240);
-        durations.extend([100; 60]);
+        durations.extend([20; 60]);
         let mut file = filmcraft_isobmff::open(synthetic_mp4(&durations, 1000, None).as_slice()).expect("parse");
         assert_eq!(video_rate(&file), Some(FrameRate::FPS_60));
 
