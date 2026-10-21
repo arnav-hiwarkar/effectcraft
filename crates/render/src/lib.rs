@@ -455,6 +455,12 @@ pub trait Accelerator: Send + Sync {
     fn auto_pick(&self) -> Option<&AutoPick> {
         None
     }
+    /// Whether the accelerator runs on a software (CPU) device — a software rasteriser such as
+    /// llvmpipe, lavapipe or SwiftShader — rather than real GPU hardware. A fixed property of the
+    /// device, independent of [`Self::available`]: a lost hardware device is not software.
+    fn is_software(&self) -> bool {
+        false
+    }
     /// Whether the accelerator can still render frames. `false` once it has stopped for good
     /// (its device was lost or retired): every frame it is asked for falls back to the CPU, so
     /// callers that limit frames in flight for it can stop doing so.

@@ -172,6 +172,17 @@ fn match_adapter_name(want: &str, adapters: &[(String, String)]) -> Result<usize
     })
 }
 
+/// Whether an adapter of `device_type` named `name` is a software (CPU) rasteriser rather than
+/// real GPU hardware: a `Cpu` device, or a known software rasteriser whose driver reports another
+/// type (`Other` on some GL drivers). Unknown names with other types stay hardware.
+fn software_adapter(device_type: wgpu::DeviceType, name: &str) -> bool {
+    if device_type == wgpu::DeviceType::Cpu {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    ["llvmpipe", "lavapipe", "swiftshader"].iter().any(|m| lower.contains(m))
+}
+
 /// The adapter named by `WGPU_ADAPTER_NAME` (case-insensitive substring, like wgpu's
 /// `initialize_adapter_from_env`, which panics when none matches). `None` when unset or empty.
 #[cfg(not(target_arch = "wasm32"))]
@@ -351,6 +362,9 @@ pub struct GpuContext {
     pub queue: wgpu::Queue,
     pub(crate) name: String,
     pub(crate) max_dim: u32,
+    /// The adapter is a software (CPU) rasteriser, not GPU hardware: it renders no faster than the
+    /// CPU compositor, so export makes it behave as if there were no accelerator.
+    pub(crate) software: bool,
     bgl: wgpu::BindGroupLayout,
     bgl_ext: wgpu::BindGroupLayout,
     pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
@@ -700,6 +714,7 @@ impl GpuContext {
             queue,
             name,
             max_dim,
+            software: software_adapter(info.device_type, &info.name),
             bgl,
             bgl_ext,
             pipelines,
@@ -1475,7 +1490,7 @@ pub(crate) fn mip_levels(w: u32, h: u32) -> u32 {
 
 #[cfg(test)]
 mod adapter_name_tests {
-    use super::{match_adapter_name, wanted_adapter_name};
+    use super::{match_adapter_name, software_adapter, wanted_adapter_name};
 
     fn adapters() -> Vec<(String, String)> {
         [("NVIDIA GeForce GTX 1070", "Vulkan"), ("Intel(R) UHD Graphics 630", "Dx12"), ("llvmpipe (LLVM 19.1.7, 256 bits)", "Gl")]
@@ -1533,5 +1548,28 @@ mod adapter_name_tests {
     fn no_adapters_has_its_own_message() {
         let e = match_adapter_name("x", &[]).unwrap_err();
         assert!(e.contains("no adapters on the enabled backends"), "{e}");
+    }
+
+    #[test]
+    fn software_adapter_classification() {
+        use wgpu::DeviceType;
+        // A CPU device is software whatever its name (even no name).
+        for name in ["", "llvmpipe", "Mesa", "AMD Radeon RX 7900 XTX (RADV NAVI31)"] {
+            assert!(software_adapter(DeviceType::Cpu, name), "Cpu {name:?}");
+        }
+        // Software rasterisers whose driver reports another type (GL reports llvmpipe as Other).
+        for name in ["llvmpipe", "LLVMPIPE", "llvmpipe (LLVM 18.1.8, 256 bits)", "Lavapipe", "SwiftShader", "Google SwiftShader Device"] {
+            assert!(software_adapter(DeviceType::Other, name), "Other {name:?}");
+        }
+        // Real hardware stays hardware, including unknown and empty names.
+        for (kind, name) in [
+            (DeviceType::DiscreteGpu, "NVIDIA GeForce GTX 1070"),
+            (DeviceType::IntegratedGpu, "Intel(R) UHD Graphics 630"),
+            (DeviceType::VirtualGpu, "Microsoft Basic Render Driver"),
+            (DeviceType::Other, ""),
+            (DeviceType::Other, "Software Adapter"),
+        ] {
+            assert!(!software_adapter(kind, name), "{kind:?} {name:?}");
+        }
     }
 }
