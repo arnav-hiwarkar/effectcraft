@@ -1525,7 +1525,9 @@ mod tests {
         assert_eq!(disk.probes.load(Ordering::Relaxed), 1);
         disk.probes.store(0, Ordering::Relaxed);
         assert!(frames.disk_frames(&src, &base, 2..2, &opts).is_empty());
-        assert!(frames.disk_frames(&src, &base, 3..2, &opts).is_empty());
+        // Written as a struct literal: `3..2` trips clippy::reversed_empty_ranges.
+        let reversed = std::ops::Range { start: 3, end: 2 };
+        assert!(frames.disk_frames(&src, &base, reversed, &opts).is_empty());
         assert_eq!(disk.probes.load(Ordering::Relaxed), 0);
     }
 
