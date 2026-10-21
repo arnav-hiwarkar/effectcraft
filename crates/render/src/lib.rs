@@ -1137,12 +1137,10 @@ impl<'a> Renderer<'a> {
                 return false;
             }
         }
-        for (name, min) in [("scale", 100.0)] {
-            let Some(prop) = transform.get(name) else { return false };
-            let Value::Vec3(value) = &prop.value else { return false };
-            if value.iter().any(|v| !v.is_finite() || *v < min) || !prop.keys.is_empty() || prop.expr.is_some() {
-                return false;
-            }
+        let Some(scale) = transform.get("scale") else { return false };
+        let Value::Vec3(value) = &scale.value else { return false };
+        if value.iter().any(|v| !v.is_finite() || *v < 100.0) || !scale.keys.is_empty() || scale.expr.is_some() {
+            return false;
         }
         for name in ["anchor", "position"] {
             let Some(prop) = transform.get(name) else { return false };

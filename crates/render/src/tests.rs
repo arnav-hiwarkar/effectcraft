@@ -30,48 +30,76 @@ fn solid_fills_comp() {
     assert_eq!(img.get(199, 99), [1.0, 0.0, 0.0, 1.0]);
 }
 
+/// Renders `cid` twice: normally (with the drawn layers' names) and with a full-frame region of
+/// interest, which never culls.
+fn occlusion_render(p: &Project, cid: ItemId) -> (crate::Image, Vec<String>, crate::Image) {
+    let log = std::sync::Mutex::new(Vec::new());
+    let img = {
+        let mut r = crate::Renderer::new(p, &crate::NoFootage, crate::RenderOpts::default());
+        r.profile = Some(&log);
+        r.comp_frame(cid, Tick::ZERO)
+    };
+    let drawn = log.into_inner().unwrap().into_iter().map(|t| t.layer).collect();
+    let roi = crate::RenderOpts { roi: Some([0.0, 0.0, 200.0, 100.0]), ..Default::default() };
+    let reference = crate::Renderer::new(p, &crate::NoFootage, roi).comp_frame(cid, Tick::ZERO);
+    (img, drawn, reference)
+}
+
+fn assert_same_bits(a: &crate::Image, b: &crate::Image) {
+    assert_eq!((a.width, a.height), (b.width, b.height));
+    for (x, y) in a.data.iter().zip(&b.data) {
+        assert_eq!(x.map(f32::to_bits), y.map(f32::to_bits));
+    }
+}
+
 #[test]
-fn occlusion_skips_hidden_source() {
+fn occlusion_skips_layers_under_an_opaque_full_frame_solid() {
     for depth in [effectcraft_project::BitDepth::Bpc8, effectcraft_project::BitDepth::Bpc16] {
-        for scale in [100.0, 200.0] {
+        for (w, h, scale) in [(200, 100, 100.0), (200, 100, 200.0), (300, 150, 100.0)] {
             let (mut p, cid, comp) = setup();
             p.settings.bit_depth = depth;
             let bottom = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
-            let top = solid(&mut p, &comp, [0.0, 1.0, 0.0], 200, 100);
-            let mut top = top;
-            let tr = top.transform_mut().unwrap();
-            tr.get_mut("scale").unwrap().value = Value::Vec3([scale; 3]);
-            let comp_mut = p.comp_mut(cid).unwrap();
-            comp_mut.layers.push(bottom);
-            comp_mut.layers.push(top);
-            let image = render_frame(&p, cid, Tick::ZERO, 1.0);
-            assert_eq!(image.get(0, 0), [0.0, 1.0, 0.0, 1.0]);
-            assert_eq!(image.get(199, 99), [0.0, 1.0, 0.0, 1.0]);
+            let mut top = solid(&mut p, &comp, [0.0, 1.0, 0.0], w, h);
+            top.name = "Top".into();
+            top.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([scale; 3]);
+            p.comp_mut(cid).unwrap().layers = vec![top, bottom];
+            let (img, drawn, reference) = occlusion_render(&p, cid);
+            assert_eq!(drawn, vec!["Top".to_string()], "{depth:?} {w}x{h} {scale}%");
+            assert_eq!(img.get(0, 0), [0.0, 1.0, 0.0, 1.0]);
+            assert_eq!(img.get(199, 99), [0.0, 1.0, 0.0, 1.0]);
+            assert_same_bits(&img, &reference);
         }
     }
 }
 
 #[test]
-fn occlusion_fallbacks() {
+fn occlusion_draws_everything_when_the_top_solid_may_not_cover() {
+    type Edit = fn(&mut effectcraft_project::Layer, effectcraft_project::LayerId);
+    let edits: [(&str, Edit); 6] = [
+        ("opacity", |l, _| l.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(99.0)),
+        ("rotation", |l, _| l.props.prop_mut("transform/rotation").unwrap().value = Value::Scalar(1.0)),
+        ("subpixel", |l, _| l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([100.5, 50.0, 0.0])),
+        ("scale", |l, _| l.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([99.0, 100.0, 100.0])),
+        ("blend", |l, _| l.blend_mode = BlendMode::Multiply),
+        ("parent", |l, below| l.parent = Some(below)),
+    ];
+    for (name, edit) in edits {
+        let (mut p, cid, comp) = setup();
+        p.settings.bit_depth = effectcraft_project::BitDepth::Bpc8;
+        let bottom = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+        let mut top = solid(&mut p, &comp, [0.0, 1.0, 0.0], 200, 100);
+        edit(&mut top, bottom.id);
+        p.comp_mut(cid).unwrap().layers = vec![top, bottom];
+        let (img, drawn, reference) = occlusion_render(&p, cid);
+        assert_eq!(drawn.len(), 2, "{name}");
+        assert_same_bits(&img, &reference);
+    }
+    // 32 bpc never culls (non-finite values below survive Normal blending).
     let (mut p, cid, comp) = setup();
-    p.settings.bit_depth = effectcraft_project::BitDepth::Bpc8;
-    let mut layer = solid(&mut p, &comp, [0.0, 1.0, 0.0], 200, 100);
-    let renderer = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default());
-    let ctx = renderer.eval_ctx(cid, Tick::ZERO).unwrap();
-    assert!(renderer.covers_frame(&ctx, &layer));
-
-    layer.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(99.0);
-    assert!(!renderer.covers_frame(&ctx, &layer));
-    layer.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(100.0);
-    layer.props.prop_mut("transform/rotation").unwrap().value = Value::Scalar(1.0);
-    assert!(!renderer.covers_frame(&ctx, &layer));
-    layer.props.prop_mut("transform/rotation").unwrap().value = Value::Scalar(0.0);
-    drop(ctx);
-    drop(renderer);
-    p.settings.bit_depth = effectcraft_project::BitDepth::Bpc32;
-    let renderer = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default());
-    let ctx = renderer.eval_ctx(cid, Tick::ZERO).unwrap();
-    assert!(!renderer.covers_frame(&ctx, &layer));
+    let bottom = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+    let top = solid(&mut p, &comp, [0.0, 1.0, 0.0], 200, 100);
+    p.comp_mut(cid).unwrap().layers = vec![top, bottom];
+    assert_eq!(occlusion_render(&p, cid).1.len(), 2);
 }
 
 #[test]
