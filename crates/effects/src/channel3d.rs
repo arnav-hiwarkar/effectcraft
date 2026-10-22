@@ -274,35 +274,35 @@ fn identifier(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let sel = ctx.params.f("id").round() as f32;
     let display = ctx.params.e("display");
     let max_id = ids.iter().cloned().fold(1.0f32, f32::max);
-    let src = b.img.clone();
     b.img.data.par_iter_mut().enumerate().for_each(|(i, px)| {
-        let Some(k) = idx[i] else {
+        let Some(k) = idx.get(i).copied().flatten() else {
             if display != 2 {
                 *px = [0.0; 4];
             }
             return;
         };
-        let id = ids[k].round();
+        let id = ids.get(k).copied().unwrap_or(0.0).round();
         let hit = id == sel;
-        *px = match display {
+        match display {
             // Colors: every ID in its own colour, the selected one highlighted white.
             0 => {
                 let c = if hit && sel != 0.0 { [1.0; 3] } else { id_color(id) };
-                [c[0], c[1], c[2], 1.0]
+                *px = [c[0], c[1], c[2], 1.0];
             }
             1 => {
                 let v = if hit { 1.0 } else { 0.0 };
-                [v, v, v, 1.0]
+                *px = [v, v, v, 1.0];
             }
             2 => {
-                let s = src.data[i];
-                if hit { s } else { [0.0; 4] }
+                if !hit {
+                    *px = [0.0; 4];
+                }
             }
             _ => {
                 let v = id / max_id;
-                [v, v, v, 1.0]
+                *px = [v, v, v, 1.0];
             }
-        };
+        }
     });
     b
 }
@@ -436,28 +436,30 @@ fn cryptomatte(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let display = ctx.params.e("display");
     let matte_only = ctx.params.b("matteOnly");
     let planes = a.crypto_rank_planes(&layer);
-    let src = b.img.clone();
     b.img.data.par_iter_mut().enumerate().for_each(|(i, px)| {
-        let m = idx[i].map_or(0.0, |k| crypto_matte(&planes, &sel, k));
+        let k_opt = idx.get(i).copied().flatten();
+        let m = k_opt.map_or(0.0, |k| crypto_matte(&planes, &sel, k));
         if matte_only {
             *px = [m, m, m, m];
             return;
         }
-        *px = match display {
+        match display {
             // Colors: coverage-weighted ID colours (the spec's preview), selection brighter.
             0 => {
-                let c = idx[i].map_or([0.0; 3], |k| crypto_colors(&planes, k));
+                let c = k_opt.map_or([0.0; 3], |k| crypto_colors(&planes, k));
                 let c = c.map(|v| v * (1.0 - 0.5 * m) + 0.5 * m);
-                [c[0], c[1], c[2], 1.0]
+                *px = [c[0], c[1], c[2], 1.0];
             }
             // Matte: the layer keyed by the selection.
-            1 => src.data[i].map(|v| v * m),
+            1 => {
+                *px = px.map(|v| v * m);
+            }
             // Preview: the layer with the selection tinted.
             _ => {
-                let s = src.data[i];
-                [s[0] * (1.0 - 0.5 * m) + 0.5 * m * s[3], s[1] * (1.0 - 0.5 * m) + 0.5 * m * s[3], s[2] * (1.0 - 0.5 * m), s[3]]
+                let s = *px;
+                *px = [s[0] * (1.0 - 0.5 * m) + 0.5 * m * s[3], s[1] * (1.0 - 0.5 * m) + 0.5 * m * s[3], s[2] * (1.0 - 0.5 * m), s[3]];
             }
-        };
+        }
     });
     b
 }
@@ -484,21 +486,22 @@ fn extractor(ctx: &EffectCtx, mut b: Buf) -> Buf {
     if src_ch.iter().all(Option::is_none) && bp == 0.0 && wp == 1.0 && !unmult && names.iter().enumerate().all(|(k, n)| own(n) == Some(k)) {
         return b;
     }
-    let src = b.img.clone();
     let lv = |v: f32| {
         let o = (v - bp) / (wp - bp).abs().max(1e-9) * (wp - bp).signum();
         if clip { o.clamp(0.0, 1.0) } else { o }
     };
     b.img.data.par_iter_mut().enumerate().for_each(|(i, px)| {
-        let (sc, sa) = unpremul(src.data[i]);
+        let (sc, sa) = unpremul(*px);
         let straight = [sc[0], sc[1], sc[2], sa];
         let mut o: Px = [0.0; 4];
+        let aux_j = idx.as_ref().and_then(|m| m.get(i).copied().flatten());
         for k in 0..4 {
-            o[k] = match (src_ch[k], idx.as_ref().and_then(|m| m[i])) {
-                (Some(ch), Some(j)) => ch[j],
+            let ch_opt = src_ch.get(k).copied().flatten();
+            o[k] = match (ch_opt, aux_j) {
+                (Some(ch), Some(j)) => ch.get(j).copied().unwrap_or(0.0),
                 (Some(_), None) => 0.0,
-                (None, _) => match own(names[k]) {
-                    Some(c) => straight[c],
+                (None, _) => match names.get(k).and_then(|n| own(n)) {
+                    Some(c) => straight.get(c).copied().unwrap_or(0.0),
                     None => {
                         if k == 3 {
                             1.0
@@ -963,5 +966,164 @@ mod tests {
         assert!(v == 0.0 || v == 1.0, "{v}");
         let soft = run("ec.3d.channelextract", &[vals.as_slice(), &[("antialias", Value::Bool(true))]].concat(), &host);
         assert!((soft.get(5, 5)[0] - 0.5).abs() < 1e-5, "{:?}", soft.get(5, 5));
+    }
+
+    #[test]
+    fn identifier_layers_mode_filters_in_place() {
+        let (w, h) = (4u32, 2u32);
+        let mut a = AuxChannels::new(w, h, 1.0);
+        let ids = vec![1.0, 2.0, 1.0, 3.0, 2.0, 1.0, 0.0, 2.0];
+        a.channels = vec![("ObjectID".into(), ids.clone())];
+        let host = AuxHost(Arc::new(a));
+
+        let mut img = Image::new(w, h);
+        for (i, p) in img.data.iter_mut().enumerate() {
+            let v = (i + 1) as f32 * 0.1;
+            *p = [v, v + 0.02, v + 0.04, 1.0];
+        }
+        let orig = img.clone();
+
+        let env = EffectEnv { host: Some(&host), ..Default::default() };
+        let out = run_fx("ec.3d.identifier", &[("display", Value::Enum(2)), ("id", num(1.0))], img, 0.0, env).img;
+
+        for (i, (&px, &orig_px)) in out.data.iter().zip(orig.data.iter()).enumerate() {
+            if ids[i] == 1.0 {
+                assert_eq!(px.map(f32::to_bits), orig_px.map(f32::to_bits), "pixel {i} match");
+            } else {
+                assert_eq!(px, [0.0; 4], "pixel {i} non-match");
+            }
+        }
+    }
+
+    #[test]
+    fn channel3d_in_place_pipeline_preserves_bit_exactness() {
+        let h = scene();
+        let mut test_img = Image::new(24, 10);
+        for y in 0..10 {
+            for x in 0..24 {
+                let fx = x as f32 / 24.0;
+                let fy = y as f32 / 10.0;
+                test_img.set(x, y, [fx * 0.8, fy * 0.8, 0.5, 0.8]);
+            }
+        }
+        let env = EffectEnv { host: Some(&h), ..Default::default() };
+
+        // 1. identifier across all display modes
+        for display in [0, 1, 2, 3] {
+            let out = run_fx("ec.3d.identifier", &[("display", Value::Enum(display)), ("id", num(1.0))], test_img.clone(), 0.0, env).img;
+
+            let a = h.aux().unwrap();
+            let ids = id_channel(&a, 0).unwrap();
+            let buf = Buf { img: test_img.clone(), offset: [0.0, 0.0], scale: 1.0 };
+            let idx = index_map(&buf, &a);
+            let max_id = ids.iter().cloned().fold(1.0f32, f32::max);
+            for i in 0..240 {
+                let want = match idx[i] {
+                    None => {
+                        if display != 2 {
+                            [0.0; 4]
+                        } else {
+                            test_img.data[i]
+                        }
+                    }
+                    Some(k) => {
+                        let id = ids[k].round();
+                        let hit = id == 1.0;
+                        match display {
+                            0 => {
+                                let c = if hit { [1.0; 3] } else { id_color(id) };
+                                [c[0], c[1], c[2], 1.0]
+                            }
+                            1 => {
+                                let v = if hit { 1.0 } else { 0.0 };
+                                [v, v, v, 1.0]
+                            }
+                            2 => {
+                                if hit {
+                                    test_img.data[i]
+                                } else {
+                                    [0.0; 4]
+                                }
+                            }
+                            _ => {
+                                let v = id / max_id;
+                                [v, v, v, 1.0]
+                            }
+                        }
+                    }
+                };
+                assert_eq!(out.data[i].map(f32::to_bits), want.map(f32::to_bits), "identifier display {display} at {i}");
+            }
+        }
+
+        // 2. cryptomatte in Matte, Preview, and Colors modes
+        let names = "left";
+        for (display, matte_only) in [(0, false), (1, false), (2, false), (0, true)] {
+            let out = run_fx(
+                "ec.3d.cryptomatte",
+                &[("selection", Value::Str(names.into())), ("display", Value::Enum(display)), ("matteOnly", Value::Bool(matte_only))],
+                test_img.clone(),
+                0.0,
+                env,
+            )
+            .img;
+
+            let a = h.aux().unwrap();
+            let planes = a.crypto_rank_planes("CryptoObject");
+            let manifest = a.manifests.iter().find(|(l, _)| *l == "CryptoObject").map(|(_, m)| m.as_slice());
+            let sel = selection_hashes(names, manifest);
+            let buf = Buf { img: test_img.clone(), offset: [0.0, 0.0], scale: 1.0 };
+            let idx = index_map(&buf, &a);
+            for i in 0..240 {
+                let m = idx[i].map_or(0.0, |k| crypto_matte(&planes, &sel, k));
+                let s = test_img.data[i];
+                let want = if matte_only {
+                    [m, m, m, m]
+                } else {
+                    match display {
+                        0 => {
+                            let c = idx[i].map_or([0.0; 3], |k| crypto_colors(&planes, k));
+                            let c = c.map(|v| v * (1.0 - 0.5 * m) + 0.5 * m);
+                            [c[0], c[1], c[2], 1.0]
+                        }
+                        1 => s.map(|v| v * m),
+                        _ => [s[0] * (1.0 - 0.5 * m) + 0.5 * m * s[3], s[1] * (1.0 - 0.5 * m) + 0.5 * m * s[3], s[2] * (1.0 - 0.5 * m), s[3]],
+                    }
+                };
+                assert_eq!(out.data[i].map(f32::to_bits), want.map(f32::to_bits), "crypto display {display} at {i}");
+            }
+        }
+
+        // 3. extractor (channel remapping and own-channel references)
+        let out = run_fx(
+            "ec.3d.extractor",
+            &[
+                ("red", Value::Str("Z".into())),
+                ("green", Value::Str("B".into())),
+                ("blue", Value::Str("R".into())),
+                ("alpha", Value::Str("A".into())),
+                ("whitePoint", num(1000.0)),
+            ],
+            test_img.clone(),
+            0.0,
+            env,
+        )
+        .img;
+
+        let a = h.aux().unwrap();
+        let z = a.get("Z").unwrap();
+        let buf = Buf { img: test_img.clone(), offset: [0.0, 0.0], scale: 1.0 };
+        let idx = index_map(&buf, &a);
+        for i in 0..240 {
+            let (sc, sa) = unpremul(test_img.data[i]);
+            let straight = [sc[0], sc[1], sc[2], sa];
+            let z_val = idx[i].map_or(0.0, |j| z[j]);
+            let r = z_val / 1000.0;
+            let g = straight[2] / 1000.0;
+            let b_val = straight[0] / 1000.0;
+            let al = straight[3].clamp(0.0, 1.0);
+            let want = premul([r, g, b_val], al);
+            assert_eq!(out.data[i].map(f32::to_bits), want.map(f32::to_bits), "extractor at {i}");
+        }
     }
 }
