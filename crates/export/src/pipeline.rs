@@ -24,6 +24,8 @@ use crate::{Job, RenderQuality, out};
 pub(crate) const GPU_INFLIGHT_DEFAULT: usize = 1;
 /// Overrides [`GPU_INFLIGHT_DEFAULT`]: a whole number of frames, at least 1.
 pub(crate) const GPU_INFLIGHT_ENV: &str = "EFFECTCRAFT_GPU_INFLIGHT";
+/// Maximum frames in flight during CPU rendering or GPU fallback.
+pub(crate) const CPU_INFLIGHT_CAP: usize = 4;
 
 /// GPU frames in flight from the `EFFECTCRAFT_GPU_INFLIGHT` value: a positive whole number, or
 /// the default (with a warning when a value was given) when it is 0, negative, not a number or
@@ -60,7 +62,7 @@ pub(crate) fn map_frames<I: Send, T: Send>(
 
 /// [`map_frames`] whose `cap` holds only while `capped()`: once it turns false (the GPU stopped
 /// for good, so every frame falls back to the CPU), the remaining frames render in parallel
-/// like the uncapped CPU path instead of one chunk of `cap` at a time.
+/// bounded by [`CPU_INFLIGHT_CAP`] instead of one chunk of `cap` at a time.
 pub(crate) fn map_frames_while<I: Send, T: Send>(
     ks: Vec<u64>,
     cap: Option<usize>,
@@ -70,20 +72,30 @@ pub(crate) fn map_frames_while<I: Send, T: Send>(
 ) -> Vec<T> {
     use rayon::prelude::*;
     let Some(n) = cap.map(|n| n.max(1)).filter(|_| capped()) else {
-        return ks.into_par_iter().map(|k| encode(k, render(k))).collect();
+        let mut out = Vec::with_capacity(ks.len());
+        for chunk in ks.chunks(CPU_INFLIGHT_CAP) {
+            out.par_extend(chunk.par_iter().map(|&k| encode(k, render(k))));
+        }
+        return out;
     };
     let window = n.max(rayon::current_num_threads());
     let mut out = Vec::with_capacity(ks.len());
     for (w, win) in ks.chunks(window).enumerate() {
         if !capped() {
-            out.par_extend(ks[w * window..].par_iter().map(|&k| encode(k, render(k))));
+            let start = w.saturating_mul(window).min(ks.len());
+            let rem = ks.get(start..).unwrap_or(&[]);
+            for chunk in rem.chunks(CPU_INFLIGHT_CAP) {
+                out.par_extend(chunk.par_iter().map(|&k| encode(k, render(k))));
+            }
             break;
         }
         let mut imgs = Vec::with_capacity(win.len());
         let mut i = 0;
         while i < win.len() {
-            let end = if capped() { (i + n).min(win.len()) } else { win.len() };
-            imgs.par_extend(win[i..end].par_iter().map(|&k| render(k)));
+            let step = if capped() { n } else { CPU_INFLIGHT_CAP };
+            let end = i.saturating_add(step).min(win.len());
+            let slice = win.get(i..end).unwrap_or(&[]);
+            imgs.par_extend(slice.par_iter().map(|&k| render(k)));
             i = end;
         }
         out.par_extend(win.par_iter().copied().zip(imgs.into_par_iter()).map(|(k, img)| encode(k, img)));
@@ -475,6 +487,37 @@ mod tests {
             },
         );
         (out, max.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn gpu_fallback_respects_cpu_inflight_cap() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        let (live, now, max) = (AtomicBool::new(true), AtomicUsize::new(0), AtomicUsize::new(0));
+        let out = pool.install(|| {
+            map_frames_while(
+                (0..24).collect(),
+                Some(1),
+                || live.load(Ordering::SeqCst),
+                |k| {
+                    if k == 1 {
+                        live.store(false, Ordering::SeqCst);
+                    }
+                    let c = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    if k >= 2 {
+                        max.fetch_max(c, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    now.fetch_sub(1, Ordering::SeqCst);
+                    k * 10
+                },
+                |_, v| v,
+            )
+        });
+        assert_eq!(out, (0..24).map(|k| k * 10).collect::<Vec<_>>());
+        let peak = max.load(Ordering::SeqCst);
+        assert!(peak <= CPU_INFLIGHT_CAP, "concurrency after GPU stopped was {peak}, expected <= {CPU_INFLIGHT_CAP}");
+        assert!(peak > 1, "frames after the GPU stopped ran one at a time");
     }
 
     #[test]
