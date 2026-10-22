@@ -22,6 +22,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use effectcraft_effects::Buf;
+use effectcraft_geom::Mat4;
 use effectcraft_project::{ItemKind, Layer, LayerSource, Node, PropGroup};
 
 use crate::eval::EvalCtx;
@@ -393,7 +394,8 @@ impl LayerStore for PrefetchStore {
     }
 }
 
-/// FNV-1a style 64-bit hasher fed by `Debug` output (exact float formatting) and raw values.
+/// FNV-1a style 64-bit hasher fed by `Debug` output (exact float formatting), raw values and
+/// matrix bits.
 struct KeyHasher(u64);
 
 impl Hasher for KeyHasher {
@@ -419,6 +421,16 @@ fn hash_debug(h: &mut KeyHasher, v: &impl std::fmt::Debug) {
     use std::fmt::Write;
     let _ = write!(h, "{v:?}");
     Hasher::write_u8(h, 0xff);
+}
+
+/// Hash a matrix by its raw float bits: no text formatting, so a matrix costs 128 bytes of
+/// hashing instead of a formatted copy of its 16 entries.
+fn hash_mat4(h: &mut KeyHasher, m: &Mat4) {
+    for row in &m.0 {
+        for v in row {
+            Hasher::write(h, &v.to_bits().to_le_bytes());
+        }
+    }
 }
 
 /// Time-based layer content: does any part of the source/effects read the clock directly

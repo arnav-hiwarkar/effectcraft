@@ -1010,3 +1010,49 @@ fn a_selected_layer_reading_the_comp_scene_invalidates_its_owner() {
     let (a, b) = (particles_x(&here), particles_x(&panned));
     assert!(b < a - 20.0, "the blended particles follow the camera: {a} -> {b}");
 }
+
+/// #66: a comp whose owner samples a parented layer (and a layer that samples itself).
+/// Layer indices: 0 owner, 1 self-sampling, 2 child (parented), 3 parent, 4 unrelated.
+fn matrix_dependency_scene(parent_x: f64, unrelated_x: f64, self_x: f64) -> (Project, ItemId) {
+    let (mut p, cid, comp) = setup();
+    let mut parent = solid(&mut p, &comp, [0.5, 0.5, 0.5], 200, 100);
+    let mut child = solid(&mut p, &comp, [0.2, 0.2, 0.2], 200, 100);
+    child.parent = Some(parent.id);
+    let mut owner = solid(&mut p, &comp, [0.0, 0.0, 0.0], 200, 100);
+    let child_id = child.id.0;
+    add_effect_200(&mut p, &mut owner, "ec.channel.blend", &[("blendWithLayer", Value::Layer(Some(child_id)))]);
+    let mut selfish = solid(&mut p, &comp, [0.0, 0.0, 0.0], 200, 100);
+    let selfish_id = selfish.id.0;
+    add_effect_200(&mut p, &mut selfish, "ec.channel.blend", &[("blendWithLayer", Value::Layer(Some(selfish_id)))]);
+    let mut unrelated = solid(&mut p, &comp, [0.1, 0.1, 0.1], 200, 100);
+    for (l, x) in [(&mut parent, parent_x), (&mut selfish, self_x), (&mut unrelated, unrelated_x)] {
+        let pr = l.props.prop_mut("transform/position").unwrap();
+        pr.value = Value::Vec3([x, 0.0, 0.0]);
+    }
+    p.comp_mut(cid).unwrap().layers = vec![owner, selfish, child, parent, unrelated];
+    (p, cid)
+}
+
+/// #66: a layer's cache key follows the matrices it depends on, not their text form: a
+/// referenced layer's parent moves (only the child's world matrix changes) and a layer that
+/// samples itself (its own transform is applied after its effects, so the matrix it samples is
+/// the only part of its key that sees it).
+#[test]
+fn dependency_key_follows_parent_matrix_not_text() {
+    const OWNER: usize = 0;
+    const SELFISH: usize = 1;
+    let key = |p: &Project, cid: ItemId, index: usize| {
+        let c = p.comp(cid).unwrap();
+        crate::cache::layer_key(&crate::EvalCtx::new(p, cid, c, Tick::ZERO), &c.layers[index], 1.0, false, false).unwrap()
+    };
+    let (base, base_id) = matrix_dependency_scene(10.0, 10.0, 10.0);
+    let (same, same_id) = matrix_dependency_scene(10.0, 10.0, 10.0);
+    assert_eq!(key(&base, base_id, OWNER), key(&same, same_id, OWNER), "an unchanged project keeps its key");
+    let (parent_moved, parent_id) = matrix_dependency_scene(40.0, 10.0, 10.0);
+    assert_ne!(key(&base, base_id, OWNER), key(&parent_moved, parent_id, OWNER), "moving the parent changes the owner's key");
+    let (self_moved, self_id) = matrix_dependency_scene(10.0, 10.0, 40.0);
+    assert_ne!(key(&base, base_id, SELFISH), key(&self_moved, self_id, SELFISH), "moving a self-sampling layer changes its key");
+    let (unrelated_moved, unrelated_id) = matrix_dependency_scene(10.0, 40.0, 10.0);
+    assert_eq!(key(&base, base_id, OWNER), key(&unrelated_moved, unrelated_id, OWNER), "an unrelated layer does not change the owner's key");
+    assert_eq!(key(&base, base_id, SELFISH), key(&unrelated_moved, unrelated_id, SELFISH), "an unrelated layer does not change the key");
+}
