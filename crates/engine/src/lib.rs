@@ -27,6 +27,7 @@ mod system;
 pub mod viewer;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use effectcraft_project::{Comp, ItemId, Layer, LayerId, Project, Uid};
 use effectcraft_raster::Image;
@@ -112,6 +113,10 @@ pub struct Session {
     /// issued, so an unavailable receipt cannot be accepted with a reused revision.
     pub ime_revision: u64,
     pub saved_revision: u64,
+    /// Moves when the media layer lets go of what it decoded: a file may have been overwritten, so
+    /// what a footage thumbnail shows has to be decoded again. Read it with
+    /// [`Session::decode_epoch`].
+    pub decode_counter: AtomicU64,
     /// The project as last opened or saved: the project is unmodified while it is this very
     /// snapshot, so undoing back to the saved state clears the modified mark.
     pub saved_project: Arc<Project>,
@@ -290,6 +295,7 @@ impl Default for Session {
             // A fresh session gets its own process-monotonic stamp even before its first edit.
             ime_revision: commands::text_edit::next_ime_revision().unwrap_or(u64::MAX),
             saved_revision: 0,
+            decode_counter: AtomicU64::new(0),
             path: None,
             state: EditorState { snapping: true, view_layout: 1, ..Default::default() },
             services: Arc::new(FsServices),

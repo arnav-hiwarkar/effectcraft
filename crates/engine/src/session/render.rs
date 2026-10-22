@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use super::{EngineError, Image, ItemId, RenderOpts, Renderer, Result, Session, ThumbnailJob, Tick, Value, commands};
 
 impl Session {
@@ -135,6 +137,19 @@ impl Session {
             self.footage.forget(p);
         }
         self.layer_cache.clear();
+        self.bump_decode_epoch();
         self.drop_crypto_probe();
+    }
+
+    /// The counter that moves when the media layer lets go of what it decoded: a thumbnail of a
+    /// file is stamped with it, so a reloaded or relinked file is decoded again.
+    pub fn decode_epoch(&self) -> u64 {
+        self.decode_counter.load(Ordering::Relaxed)
+    }
+
+    /// Move the decode epoch (see [`Session::decode_epoch`]): what was decoded is gone, so what
+    /// a file shows has to be read again.
+    pub(crate) fn bump_decode_epoch(&self) {
+        self.decode_counter.fetch_add(1, Ordering::Relaxed);
     }
 }

@@ -58,3 +58,16 @@ mod timeline_interchange;
 pub(crate) mod track;
 mod vector_import;
 mod viewer;
+
+/// The decode epoch moves when the media layer lets go of what it decoded, so a thumbnail of a
+/// file that was reloaded or relinked is decoded again.
+#[test]
+fn forget_decoded_advances_decode_epoch() {
+    let s = crate::Session::default();
+    let footage = crate::project::Footage { path: "/tmp/clip.mov".into(), ..Default::default() };
+    let before = s.decode_epoch();
+    s.forget_decoded(&footage);
+    assert_eq!(s.decode_epoch(), before + 1);
+    s.forget_decoded(&footage);
+    assert_eq!(s.decode_epoch(), before + 2);
+}
