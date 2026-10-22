@@ -85,9 +85,9 @@ pub struct DiskStats {
 struct Meta {
     bytes: u64,
     last_use: u64,
-    /// Last time the entry's recency was (or was not) persisted to disk, on the caller's
-    /// millisecond clock; 0 = just written, so a fresh entry is already "persisted".
-    persisted_ms: u64,
+    /// Last time the entry's recency was persisted to disk, on the caller's millisecond clock;
+    /// `None` = never persisted (`insert` doesn't mark one), so the next hit persists.
+    persisted_ms: Option<u64>,
 }
 
 /// Persist an entry's recency to disk at most once per this many milliseconds per hit.
@@ -108,7 +108,7 @@ impl DiskIndex {
     pub fn insert(&mut self, kind: Kind, key: u128, bytes: u64) {
         self.clock += 1;
         let c = self.clock;
-        if let Some(old) = self.map.insert((kind, key), Meta { bytes, last_use: c, persisted_ms: 0 }) {
+        if let Some(old) = self.map.insert((kind, key), Meta { bytes, last_use: c, persisted_ms: None }) {
             self.total -= old.bytes;
         }
         self.total += bytes;
@@ -116,21 +116,24 @@ impl DiskIndex {
 
     /// Mark an entry as just used (a read). `false` when it is not indexed.
     pub fn touch(&mut self, kind: Kind, key: u128) -> bool {
-        // Recency-only (no disk write): 0 ms never reaches the persist window.
-        self.touch_at(kind, key, 0).unwrap_or(false)
+        let Some(m) = self.map.get_mut(&(kind, key)) else { return false };
+        self.clock += 1;
+        m.last_use = self.clock;
+        true
     }
 
     /// Mark an entry as just used and report whether its recency should be persisted to disk
-    /// (`Some(true)`, at most once per entry per [`RECENCY_PERSIST_MS`]), `Some(false)` when
-    /// nothing is due, `None` when it is not indexed. `now_ms` is on the caller's clock: it
-    /// never needs to be serialised, so the index stays portable.
+    /// (`Some(true)`, the entry's first hit since it was written or once per entry per
+    /// [`RECENCY_PERSIST_MS`] after that), `Some(false)` when nothing is due, `None` when it is
+    /// not indexed. `now_ms` is on the caller's clock: it never needs to be serialised, so the
+    /// index stays portable.
     pub fn touch_at(&mut self, kind: Kind, key: u128, now_ms: u64) -> Option<bool> {
         let m = self.map.get_mut(&(kind, key))?;
         self.clock += 1;
         m.last_use = self.clock;
-        let due = now_ms.saturating_sub(m.persisted_ms) >= RECENCY_PERSIST_MS;
+        let due = m.persisted_ms.is_none_or(|p| now_ms.saturating_sub(p) >= RECENCY_PERSIST_MS);
         if due {
-            m.persisted_ms = now_ms;
+            m.persisted_ms = Some(now_ms);
         }
         Some(due)
     }
@@ -936,23 +939,28 @@ mod tests {
     }
 
     /// Recency is persisted to disk at most once per entry per 60 s window (a cached frame
-    /// played back at 30/s must not open + rewrite the file 30 times a second).
+    /// played back at 30/s must not open + rewrite the file 30 times a second). A never
+    /// persisted entry (`insert` never marks one, so rescanned entries after a restart too) is
+    /// due on its first hit, at any point on the caller's clock.
     #[test]
     fn touch_at_persists_once_per_window() {
         let mut ix = DiskIndex::default();
         ix.insert(Kind::Frame, 1, 100);
-        // First hit (a fresh entry counts as just written, but a hit 100 s after that is due).
-        assert_eq!(ix.touch_at(Kind::Frame, 1, 100_000), Some(true));
+        // First hit: always due, even at time zero.
+        assert_eq!(ix.touch_at(Kind::Frame, 1, 0), Some(true));
         // 50 further hits within the 60 s window are all not due and change nothing.
         for i in 1..=50u64 {
-            assert_eq!(ix.touch_at(Kind::Frame, 1, 100_000 + i * 200), Some(false));
+            assert_eq!(ix.touch_at(Kind::Frame, 1, i * 1_000), Some(false));
         }
         // Past the window (60 s after the last persist) the recency is persisted again.
-        assert_eq!(ix.touch_at(Kind::Frame, 1, 160_000), Some(true));
-        assert_eq!(ix.touch_at(Kind::Frame, 1, 160_001), Some(false));
-        // Plain `touch` never asks for a persist.
+        assert_eq!(ix.touch_at(Kind::Frame, 1, 60_000), Some(true));
+        assert_eq!(ix.touch_at(Kind::Frame, 1, 60_001), Some(false));
+        // Plain `touch` never asks for a persist (and does not shift the window).
         assert!(ix.touch(Kind::Frame, 1));
         assert_eq!(ix.touch_at(Kind::Frame, 1, 0), Some(false));
+        // A fresh entry's first hit is also due at a nonzero time.
+        ix.insert(Kind::Frame, 2, 100);
+        assert_eq!(ix.touch_at(Kind::Frame, 2, 1_000), Some(true));
     }
 
     /// A missing or removed entry reports `None` instead of panicking, and `touch_at` still
@@ -973,13 +981,16 @@ mod tests {
         assert_eq!(ix.lru_order(), vec![(Kind::Frame, 2), (Kind::Frame, 1)]);
     }
 
-    /// Hits inside the persist window never rewrite the cached file's modification time.
+    /// Hits inside the persist window never rewrite the cached file's modification time. The
+    /// warm-up hit is the one persist (a fresh entry is never marked as persisted); the next 60 s
+    /// of hits are pure reads.
     #[test]
     fn hits_within_the_window_keep_the_file_mtime() {
         let dir = tmpdir("mtime");
         let dc = DiskCache::open(&dir, 1 << 30).unwrap();
         dc.put_frame_now(9, 8, 8, &[3; 256]);
         let p = dc.path(Kind::Frame, 9);
+        assert_eq!(dc.get_frame(9).unwrap().rgba, vec![3; 256]);
         let written = std::fs::metadata(&p).and_then(|m| m.modified()).unwrap();
         for _ in 0..100 {
             assert_eq!(dc.get_frame(9).unwrap().rgba, vec![3; 256]);
