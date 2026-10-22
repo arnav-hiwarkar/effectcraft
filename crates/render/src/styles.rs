@@ -816,7 +816,12 @@ mod tests {
         }
         // Zero size: the returned plane owns the unchanged alpha (or its inverse).
         let d = Lazy(OnceLock::new());
-        let unblurred = soft_shape(&filled, &d, 0.0, 1.0, false);
+        let mut source = filled.clone();
+        let unblurred = soft_shape(&source, &d, 0.0, 1.0, false);
+        // Changing the source afterwards leaves the result untouched: it owns its own copy.
+        for v in source.data.iter_mut() {
+            *v = 0.5;
+        }
         assert_eq!((unblurred.w, unblurred.h), (3, 2));
         assert_eq!(unblurred.data, [0.0, 0.25, 1.0, 0.75, 0.5, 0.0]);
         let inverted = soft_shape(&filled, &d, 0.0, 1.0, true);
