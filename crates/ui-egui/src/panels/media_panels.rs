@@ -27,6 +27,44 @@ use crate::{EffectcraftApp, widgets};
 type Thumb = Option<(egui::TextureHandle, [u32; 2])>;
 type Listing = (f64, Arc<Result<Vec<mb::Entry>, String>>);
 
+/// Longest side of a Media Browser thumbnail, in pixels.
+const THUMB_MAX: u32 = 128;
+
+/// Thumbnail size to ask a [`effectcraft_render::FootageSource`] for, from a probe of `w` × `h`:
+/// the long side steps down to ≤ [`THUMB_MAX`] (so e.g. 1920 × 1080 → 128 × 72; a 0-size probe is
+/// guarded by `thumbnail`, which decodes the plain frame instead).
+fn thumb_target(w: u32, h: u32) -> (u32, u32) {
+    let step = w.max(h).div_ceil(THUMB_MAX).max(1);
+    (w.div_ceil(step).max(1), h.div_ceil(step).max(1))
+}
+
+/// Step-sampled RGBA pixels of `img` at long side ≤ [`THUMB_MAX`] (`None` on an empty image or
+/// an out-of-range read; also what a source that returned the full frame after
+/// [`thumb_target`] goes through).
+fn thumb_pixels(img: &effectcraft_render::Image) -> Option<([u32; 2], Vec<u8>)> {
+    if img.width == 0 || img.height == 0 {
+        return None;
+    }
+    let step = img.width.max(img.height).div_ceil(THUMB_MAX).max(1);
+    let (w, h) = (img.width.div_ceil(step), img.height.div_ceil(step));
+    let full = img.to_rgba8();
+    let mut px = Vec::with_capacity(w as usize * h as usize * 4);
+    for y in 0..h {
+        for x in 0..w {
+            let row = (y as u64).checked_mul(step as u64)?;
+            let col = (x as u64).checked_mul(step as u64)?;
+            let i = row.checked_mul(img.width as u64)?.checked_add(col)?;
+            let i = usize::try_from(i.checked_mul(4)?).ok()?;
+            px.extend_from_slice(full.get(i..i.checked_add(4)?)?);
+        }
+    }
+    let want = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    if px.len() != want {
+        return None;
+    }
+    Some(([w, h], px))
+}
+
 /// Thumbnail of a file (cached per path; `None` while not decoded or not decodable).
 fn thumbnail(app: &EffectcraftApp, ctx: &egui::Context, path: &str, budget: &mut u32) -> Thumb {
     let id = egui::Id::new(("mb-thumb", path));
@@ -45,17 +83,20 @@ fn thumbnail(app: &EffectcraftApp, ctx: &egui::Context, path: &str, budget: &mut
         }
         // A synthetic item id keyed by the path (the frame cache keys on the path).
         let hid = path.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3)) | (1 << 62);
-        let img = app.session.footage.frame(ItemId(hid), &f, effectcraft_engine::time::Tick::ZERO)?;
-        let step = (img.width.max(img.height) as f32 / 128.0).ceil().max(1.0) as u32;
-        let (w, h) = (img.width.div_ceil(step), img.height.div_ceil(step));
-        let full = img.to_rgba8();
-        let mut px = Vec::with_capacity((w * h * 4) as usize);
-        for y in 0..h {
-            for x in 0..w {
-                let i = (((y * step) * img.width + x * step) * 4) as usize;
-                px.extend_from_slice(&full[i..i + 4]);
+        // Ask for the thumbnail size directly when the probe says how big the frame is (movies
+        // decode already scaled, off the shared full-frame cache); the default `frame_at_size`
+        // returns the full frame, which `thumb_pixels` downsamples.
+        let img = if f.width == 0 || f.height == 0 {
+            app.session.footage.frame(ItemId(hid), &f, effectcraft_engine::time::Tick::ZERO)?
+        } else {
+            let (tw, th) = thumb_target(f.width, f.height);
+            match app.session.footage.frame_at_size(ItemId(hid), &f, effectcraft_engine::time::Tick::ZERO, tw, th) {
+                Some(img) => img,
+                // A source that cannot make it at that size: the whole frame, as before.
+                None => app.session.footage.frame(ItemId(hid), &f, effectcraft_engine::time::Tick::ZERO)?,
             }
-        }
+        };
+        let ([w, h], px) = thumb_pixels(&img)?;
         let tex = ctx.load_texture(format!("mb-{path}"), egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &px), egui::TextureOptions::LINEAR);
         Some((tex, [w, h]))
     })();
@@ -466,5 +507,20 @@ mod tests {
         before.sort();
         after.sort();
         println!("1,000 Media Browser entries, median per warm cache lookup: {:?} -> {:?}", before[2] / 1000, after[2] / 1000);
+    }
+
+    #[test]
+    fn thumb_target_steps_a_full_frame_down_to_128() {
+        assert_eq!(thumb_target(1920, 1080), (128, 72));
+        assert_eq!(thumb_target(3840, 2160), (128, 72));
+        assert_eq!(thumb_target(127, 63), (127, 63));
+        // Long side exactly 128: native.
+        assert_eq!(thumb_target(128, 64), (128, 64));
+        // Tall frame.
+        assert_eq!(thumb_target(1080, 1920), (72, 128));
+        // Degenerate / tiny sizes are guarded, never divide by zero.
+        assert_eq!(thumb_target(0, 0), (1, 1));
+        assert_eq!(thumb_target(0, 1080), (1, 120));
+        assert_eq!(thumb_target(1, 1), (1, 1));
     }
 }
