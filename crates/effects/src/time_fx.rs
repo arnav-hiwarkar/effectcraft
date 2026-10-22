@@ -351,7 +351,7 @@ fn time_difference(ctx: &EffectCtx, b: Buf) -> Buf {
     let abs = ctx.params.b("absoluteDifference");
     let amode = ctx.params.e("alphaChannel");
     let target_id = ctx.params.get("targetLayer").and_then(Value::as_layer);
-    let (cur, target) = match target_id.and_then(|id| host.layer_at(id, ctx.env.comp_time + off, false)) {
+    let (mut cur, target) = match target_id.and_then(|id| host.layer_at(id, ctx.env.comp_time + off, false)) {
         Some(other) => {
             let Some(mut fr) = fetch(ctx, &[ctx.time]) else { return b };
             let cur = fr.imgs.pop().unwrap_or_default();
@@ -365,8 +365,7 @@ fn time_difference(ctx: &EffectCtx, b: Buf) -> Buf {
             (with_img(fr.grid, cur), tgt)
         }
     };
-    let mut out = cur.img.clone();
-    out.data.par_iter_mut().zip(target.data.par_iter()).for_each(|(o, t)| {
+    cur.img.data.par_iter_mut().zip(target.data.par_iter()).for_each(|(o, t)| {
         let (c, ca) = unpremul(*o);
         let (d, da) = unpremul(*t);
         let mut rgb = [0.0f32; 3];
@@ -393,7 +392,7 @@ fn time_difference(ctx: &EffectCtx, b: Buf) -> Buf {
         .clamp(0.0, 1.0);
         *o = [rgb[0] * a, rgb[1] * a, rgb[2] * a, a];
     });
-    Buf { img: out, ..cur }
+    cur
 }
 
 // ---------------------------------------------------------------- Time Displacement
@@ -407,7 +406,7 @@ fn time_displacement(ctx: &EffectCtx, b: Buf) -> Buf {
     let stretch = ctx.params.b("stretchMap");
     let Some(mut cur) = fetch(ctx, &[ctx.time]) else { return b };
     let cur_img = cur.imgs.pop().unwrap_or_default();
-    let grid = with_img(cur.grid, cur_img);
+    let mut grid = with_img(cur.grid, cur_img);
     let map = match ctx.layer_param("displacementMapLayer", true) {
         Some(o) => fit_layer(ctx, &grid, &o, stretch),
         None => grid.img.clone(),
@@ -438,15 +437,17 @@ fn time_displacement(ctx: &EffectCtx, b: Buf) -> Buf {
     let dx = (fr.grid.offset[0] - grid.offset[0]).round() as i64;
     let dy = (fr.grid.offset[1] - grid.offset[1]).round() as i64;
     let w = grid.img.width as usize;
-    let mut out = grid.img.clone();
-    out.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+    if w == 0 {
+        return grid;
+    }
+    grid.img.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         for (x, o) in row.iter_mut().enumerate() {
             let k = idx[y * w + x];
             let fi = keys.binary_search(&k).unwrap_or(0);
             *o = fr.imgs[fi].get(x as i64 + dx, y as i64 + dy);
         }
     });
-    with_img(grid, out)
+    grid
 }
 
 // ---------------------------------------------------------------- Timewarp
@@ -1194,5 +1195,157 @@ mod tests {
         let h = Clock { static_layer: true };
         let out = run("ec.time.timedisplacement", &[], 0.0, &h);
         assert!((out.img.data[0][0] - 0.4).abs() < 1e-5);
+    }
+
+    #[test]
+    fn time_difference_in_place_preserves_output_and_avoids_clone() {
+        struct EmptyHost;
+        impl EffectHost for EmptyHost {
+            fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
+                None
+            }
+            fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+                None
+            }
+            fn self_at(&self, _: f64, _: usize) -> Option<Buf> {
+                None
+            }
+        }
+
+        // Handles empty (0x0) buffers without panic.
+        let env_empty = EffectEnv { host: Some(&EmptyHost), ..Default::default() };
+        let empty_out = run_fx("ec.time.timedifference", &[], Image::new(0, 0), 0.0, env_empty);
+        assert_eq!(empty_out.img.width, 0);
+        assert_eq!(empty_out.img.height, 0);
+
+        let env_none = EffectEnv { host: None, ..Default::default() };
+        let empty_none = run_fx("ec.time.timedifference", &[], Image::new(0, 0), 0.0, env_none);
+        assert_eq!(empty_none.img.width, 0);
+        assert_eq!(empty_none.img.height, 0);
+
+        // Host providing changing frames with non-trivial RGB and alpha gradients.
+        struct DiffHost;
+        impl EffectHost for DiffHost {
+            fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
+                None
+            }
+            fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+                None
+            }
+            fn self_at(&self, t: f64, _: usize) -> Option<Buf> {
+                let mut img = Image::new(4, 4);
+                for y in 0..4 {
+                    for x in 0..4 {
+                        let r = ((x as f32 + t as f32 * 0.5) * 0.2).clamp(0.0, 1.0);
+                        let g = ((y as f32 + t as f32 * 0.3) * 0.2).clamp(0.0, 1.0);
+                        let b = 0.5f32;
+                        let a = ((x + y) as f32 * 0.1 + 0.2).clamp(0.0, 1.0);
+                        img.set(x, y, [r * a, g * a, b * a, a]);
+                    }
+                }
+                Some(Buf { img, offset: [0.0; 2], scale: 1.0 })
+            }
+        }
+
+        let host = DiffHost;
+        let env = EffectEnv { host: Some(&host), frame_rate: 10.0, comp_time: 1.0, ..Default::default() };
+
+        for amode in 0..=8 {
+            for abs in [true, false] {
+                for contrast in [0.0, 25.0, 50.0] {
+                    for offset in [-0.5, 0.2, 0.5] {
+                        let vals = [
+                            ("timeOffset", num(offset)),
+                            ("contrast", num(contrast)),
+                            ("absoluteDifference", Value::Bool(abs)),
+                            ("alphaChannel", Value::Enum(amode)),
+                        ];
+                        let out1 = run_fx("ec.time.timedifference", &vals, Image::filled(4, 4, [0.5, 0.5, 0.5, 1.0]), 1.0, env.clone());
+                        let out2 = run_fx("ec.time.timedifference", &vals, Image::filled(4, 4, [0.5, 0.5, 0.5, 1.0]), 1.0, env.clone());
+                        assert_eq!(out1.img.data, out2.img.data);
+
+                        let gain = 1.0 + contrast as f32 / 25.0;
+                        let cur_buf = host.self_at(1.0, usize::MAX).unwrap();
+                        let tgt_buf = host.self_at(1.0 + offset, usize::MAX).unwrap();
+                        for ((c_raw, t_raw), o_raw) in cur_buf.img.data.iter().zip(tgt_buf.img.data.iter()).zip(out1.img.data.iter()) {
+                            let (c, ca) = unpremul(*c_raw);
+                            let (d, da) = unpremul(*t_raw);
+                            let mut rgb = [0.0f32; 3];
+                            for i in 0..3 {
+                                let diff = c[i] - d[i];
+                                rgb[i] = if abs { (diff.abs() * gain).clamp(0.0, 1.0) } else { (0.5 + diff * 0.5 * gain).clamp(0.0, 1.0) };
+                            }
+                            let light = (rgb[0].max(rgb[1]).max(rgb[2]) + rgb[0].min(rgb[1]).min(rgb[2])) * 0.5;
+                            let a = match amode {
+                                1 => da,
+                                2 => (ca + da) * 0.5,
+                                3 => ca.max(da),
+                                4 => 1.0,
+                                5 => light,
+                                6 => rgb[0].max(rgb[1]).max(rgb[2]),
+                                7 => (ca - da).abs() * gain,
+                                8 => {
+                                    let a = ((ca - da).abs() * gain).clamp(0.0, 1.0);
+                                    rgb = [1.0; 3];
+                                    a
+                                }
+                                _ => ca,
+                            }
+                            .clamp(0.0, 1.0);
+                            let expected = [rgb[0] * a, rgb[1] * a, rgb[2] * a, a];
+                            for i in 0..4 {
+                                assert!(
+                                    (o_raw[i] - expected[i]).abs() < 1e-6,
+                                    "amode={amode} abs={abs} contrast={contrast} offset={offset}: got {:?} expected {:?}",
+                                    o_raw,
+                                    expected
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn time_displacement_in_place_preserves_output_and_avoids_clone() {
+        struct EmptyHost;
+        impl EffectHost for EmptyHost {
+            fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
+                None
+            }
+            fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+                None
+            }
+            fn self_at(&self, _: f64, _: usize) -> Option<Buf> {
+                None
+            }
+        }
+
+        // Handles empty (0x0) frames without panic.
+        let env_empty = EffectEnv { host: Some(&EmptyHost), ..Default::default() };
+        let empty_out = run_fx("ec.time.timedisplacement", &[], Image::new(0, 0), 0.0, env_empty);
+        assert_eq!(empty_out.img.width, 0);
+        assert_eq!(empty_out.img.height, 0);
+
+        let env_none = EffectEnv { host: None, ..Default::default() };
+        let empty_none = run_fx("ec.time.timedisplacement", &[], Image::new(0, 0), 0.0, env_none);
+        assert_eq!(empty_none.img.width, 0);
+        assert_eq!(empty_none.img.height, 0);
+
+        // Displaces across frames with non-trivial luminance gradients with bit-identical output.
+        let env = EffectEnv { host: Some(&Moving), frame_rate: 10.0, comp_time: 1.0, ..Default::default() };
+        for max_disp in [0.1, 0.3] {
+            for res in [10.0, 30.0] {
+                let vals = [("maxDisplacementTime", num(max_disp)), ("timeResolution", num(res))];
+                let out1 = run_fx("ec.time.timedisplacement", &vals, Image::new(96, 64), 1.0, env.clone());
+                let out2 = run_fx("ec.time.timedisplacement", &vals, Image::new(96, 64), 1.0, env.clone());
+                assert_eq!(out1.img.data, out2.img.data);
+                assert_eq!(out1.img.width, 96);
+                assert_eq!(out1.img.height, 64);
+                assert!(out1.img.data.iter().any(|p| p[0] > 0.1 || p[1] > 0.1 || p[2] > 0.1));
+            }
+        }
     }
 }
