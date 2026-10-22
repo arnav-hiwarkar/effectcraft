@@ -185,7 +185,7 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
         let k = ((l - thr) / (1.0 - thr).max(1e-3)).clamp(0.0, 1.0);
         if let Some(map) = &arbitrary {
             let t = glow_ab_t(l, looping, loops, phase, mid);
-            let c = map.iter().map(|cv| cv.as_ref().map_or(t, |cv| cv.eval(t))).collect::<Vec<f32>>();
+            let c: [f32; 3] = std::array::from_fn(|i| map.get(i).and_then(Option::as_ref).map_or(t, |cv| cv.eval(t)));
             *px = [c[0] * k * a, c[1] * k * a, c[2] * k * a, k * a];
         } else if use_colors {
             let t = glow_ab_t(l, looping, loops, phase, mid);
@@ -779,5 +779,28 @@ mod tests {
         let red = run(&[("colors", Value::Enum(2)), ("arbitraryMap", Value::Str("0,1 1,1|0,0 1,0|0,0 1,0".into())), ("operation", Value::Enum(2))]);
         let p = red.get(6, 12);
         assert!(p[0] > 0.05 && p[1] < 1e-4 && p[2] < 1e-4, "{p:?}");
+    }
+
+    /// Arbitrary Map mode must render identically to the equivalent A & B Colors gradient
+    /// (identity curves = black-to-white, a flat curve = a constant colour).
+    #[test]
+    fn glow_arbitrary_map_matches_ab_colors() {
+        let run = |vals: &[(&str, Value)]| run_fx("ec.stylize.glow", vals, scene(), 0.0, EffectEnv::default());
+        let cmp = |map: Value, ca: Value, cb: Value| {
+            let m = run(&[("colors", Value::Enum(2)), ("arbitraryMap", map), ("operation", Value::Enum(2))]);
+            let ab = run(&[("colors", Value::Enum(1)), ("colorA", ca), ("colorB", cb), ("operation", Value::Enum(2))]);
+            assert_eq!(m.offset, ab.offset);
+            let (m, a) = (&m.img, &ab.img);
+            assert_eq!((m.width, m.height, m.data.len()), (a.width, a.height, a.data.len()));
+            for (x, y) in m.data.iter().zip(a.data.iter()) {
+                for c in 0..4 {
+                    assert!((x[c] - y[c]).abs() <= 1e-6, "{x:?} vs {y:?}");
+                }
+            }
+        };
+        // Empty map (all identity curves) == black-to-white A & B.
+        cmp(Value::Str(String::new()), col(0.0, 0.0, 0.0), col(1.0, 1.0, 1.0));
+        // A flat red curve == red-to-red A & B (green/blue stay identity).
+        cmp(Value::Str("0,1 1,1|0,0 1,0|0,0 1,0".into()), col(1.0, 0.0, 0.0), col(1.0, 0.0, 0.0));
     }
 }
