@@ -47,6 +47,19 @@ fn demo_layer_cache_is_transparent() {
     }
 }
 
+/// The decode epoch moves when the media layer lets go of what it decoded, so a thumbnail of a
+/// file that was reloaded or relinked is decoded again.
+#[test]
+fn forget_decoded_advances_decode_epoch() {
+    let s = Session::default();
+    let footage = crate::project::Footage { path: "/tmp/clip.mov".into(), ..Default::default() };
+    let before = s.decode_epoch();
+    s.forget_decoded(&footage);
+    assert_eq!(s.decode_epoch(), before + 1);
+    s.forget_decoded(&footage);
+    assert_eq!(s.decode_epoch(), before + 2);
+}
+
 /// `layer.addItem` puts the layer at `index` (1-based) in the stack and starts it at `time`, as a
 /// drop in the Timeline does (#89).
 #[test]

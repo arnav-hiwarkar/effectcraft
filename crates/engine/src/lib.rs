@@ -51,6 +51,7 @@ pub mod warp;
 pub mod xml_project;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use effectcraft_project::{Comp, ItemId, Layer, LayerId, Project, Uid};
 use effectcraft_raster::Image;
@@ -395,6 +396,10 @@ pub struct Session {
     pub history: History,
     pub revision: u64,
     pub saved_revision: u64,
+    /// Moves when the media layer lets go of what it decoded: a file may have been overwritten, so
+    /// what a footage thumbnail shows has to be decoded again. Read it with
+    /// [`Session::decode_epoch`].
+    pub decode_counter: AtomicU64,
     /// The project as last opened or saved: the project is unmodified while it is this very
     /// snapshot, so undoing back to the saved state clears the modified mark.
     pub saved_project: Arc<Project>,
@@ -561,6 +566,7 @@ impl Default for Session {
             history: History::default(),
             revision: 0,
             saved_revision: 0,
+            decode_counter: AtomicU64::new(0),
             path: None,
             state: EditorState { snapping: true, view_layout: 1, ..Default::default() },
             services: Arc::new(FsServices),
@@ -1131,6 +1137,19 @@ impl Session {
             self.footage.forget(p);
         }
         self.layer_cache.clear();
+        self.bump_decode_epoch();
+    }
+
+    /// The counter that moves when the media layer lets go of what it decoded: a thumbnail of a
+    /// file is stamped with it, so a reloaded or relinked file is decoded again.
+    pub fn decode_epoch(&self) -> u64 {
+        self.decode_counter.load(Ordering::Relaxed)
+    }
+
+    /// Move the decode epoch (see [`Session::decode_epoch`]): what was decoded is gone, so what
+    /// a file shows has to be read again.
+    pub(crate) fn bump_decode_epoch(&self) {
+        self.decode_counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Replace the whole project (open/new), resetting history and state.

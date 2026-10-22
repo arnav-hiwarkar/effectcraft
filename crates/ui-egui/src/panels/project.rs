@@ -7,10 +7,12 @@
 //! extend the selection and open / close folders; rows and buttons carry AccessKit names and
 //! states for screen readers). Edits are engine commands, so they are undoable.
 
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
+use effectcraft_engine::Session;
 use effectcraft_engine::color::Label;
-use effectcraft_engine::project::{Item, ItemId, ItemKind};
+use effectcraft_engine::project::{AlphaMode, Item, ItemId, ItemKind};
 use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::json;
 
@@ -119,16 +121,49 @@ pub fn drop_folder(project: &effectcraft_engine::project::Project, row: Option<I
     if it.is_folder() { Some(it.id) } else { it.parent }
 }
 
-/// A thumbnail being rendered off the UI thread: (revision, result slot).
+/// A thumbnail being rendered off the UI thread: (its stamp, result slot).
 type PendingThumb = (u64, Arc<Mutex<Option<Option<(u32, u32, Vec<u8>)>>>>);
 
-/// Thumbnail of a comp (its current time) or footage (first frame), cached per item/revision.
+/// The cache stamp of an item's thumbnail: a comp shows the project as it is now, so it follows
+/// the project revision, but a footage item shows its first frame, which only depends on the
+/// file: it is stamped by the footage itself (and by the decode epoch, which moves when the
+/// media layer lets go of what it decoded), so editing the project does not decode it again.
+fn thumb_stamp(session: &Session, it: &Item) -> u64 {
+    match &it.kind {
+        ItemKind::Footage(f) => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            f.path.hash(&mut h);
+            f.sequence.hash(&mut h);
+            f.missing.hash(&mut h);
+            f.has_video.hash(&mut h);
+            f.color_profile.hash(&mut h);
+            let alpha = match f.alpha {
+                AlphaMode::Straight => 0u8,
+                AlphaMode::Premultiplied => 1,
+                AlphaMode::Ignore => 2,
+            };
+            alpha.hash(&mut h);
+            if let Some(l) = &f.layer {
+                // `SourceLayer` is not `Hash`: its `Debug` form identifies it.
+                format!("{:?}", l).hash(&mut h);
+            }
+            for c in f.premul_color {
+                c.to_bits().hash(&mut h);
+            }
+            session.decode_epoch().hash(&mut h);
+            h.finish()
+        }
+        _ => session.revision,
+    }
+}
+
+/// Thumbnail of a comp (its current time) or footage (first frame), cached per item and stamp.
 /// Rendered on a background thread (inline on wasm32): until the new one lands the previous
 /// thumbnail stays up, so selecting a big comp or editing it never stalls the panel.
 fn thumbnail(app: &EffectcraftApp, ctx: &egui::Context, it: &Item) -> Option<egui::TextureHandle> {
     let key = egui::Id::new(("proj-thumb", it.id.0));
     let pkey = egui::Id::new(("proj-thumb-pending", it.id.0));
-    let rev = app.session.revision;
+    let stamp = thumb_stamp(&app.session, it);
     let cached: Option<(u64, egui::TextureHandle)> = ctx.data(|d| d.get_temp(key));
     let mut tex = cached.as_ref().map(|(_, t)| t.clone());
     let have = cached.as_ref().map(|(r, _)| *r);
@@ -145,7 +180,7 @@ fn thumbnail(app: &EffectcraftApp, ctx: &egui::Context, it: &Item) -> Option<egu
                     d.remove::<PendingThumb>(pkey);
                 });
                 tex = Some(t);
-                if *prev == rev {
+                if *prev == stamp {
                     return tex;
                 }
             }
@@ -159,7 +194,7 @@ fn thumbnail(app: &EffectcraftApp, ctx: &egui::Context, it: &Item) -> Option<egu
             }
         }
     }
-    if have == Some(rev) {
+    if have == Some(stamp) {
         return tex;
     }
     let t = app.session.state.times.get(&it.id).copied().unwrap_or_default();
@@ -179,7 +214,7 @@ fn thumbnail(app: &EffectcraftApp, ctx: &egui::Context, it: &Item) -> Option<egu
             return tex;
         }
     }
-    ctx.data_mut(|d| d.insert_temp::<PendingThumb>(pkey, (rev, slot)));
+    ctx.data_mut(|d| d.insert_temp::<PendingThumb>(pkey, (stamp, slot)));
     ctx.request_repaint();
     tex
 }
@@ -1262,6 +1297,45 @@ mod tests {
         assert_eq!(fmt_dur(3725.48, 25.0), "1:02:05:12");
         assert_eq!(fmt_size(1000), "1 KB");
         assert_eq!(fmt_size(5 * 1024 * 1024 + 300_000), "5.3 MB");
+    }
+
+    /// A footage thumbnail shows the file's first frame: editing the project must not decode it
+    /// again, but a relinked or missing file must refresh it.
+    #[test]
+    fn footage_thumbnail_not_redecoded_on_revision_bumps() {
+        let mut session = Session::default();
+        let mut project = Project::default();
+        let fid =
+            project.add_item("Clip", Label::Aqua, None, ItemKind::Footage(Footage { path: "/tmp/clip.mov".into(), has_video: true, ..Default::default() }));
+        session.project = Arc::new(project);
+        session.execute("comp.new", json!({ "name": "C" })).unwrap();
+        let cid = session.project.comps().next().map(|(id, _)| *id).unwrap();
+        let footage = session.project.item(fid).unwrap().clone();
+        let comp = session.project.item(cid).unwrap().clone();
+
+        let footage_stamp = thumb_stamp(&session, &footage);
+        let comp_stamp = thumb_stamp(&session, &comp);
+        for _ in 0..50 {
+            session.bump();
+        }
+        assert_eq!(thumb_stamp(&session, &footage), footage_stamp, "a footage thumbnail is not decoded again on every edit");
+        assert_ne!(thumb_stamp(&session, &comp), comp_stamp, "a comp thumbnail follows the project revision");
+
+        // A relinked file (another path) is decoded again.
+        let proj = Arc::make_mut(&mut session.project);
+        if let ItemKind::Footage(f) = &mut proj.item_mut(fid).unwrap().kind {
+            f.path = "/tmp/other.mov".into();
+        }
+        let relinked = session.project.item(fid).unwrap().clone();
+        assert_ne!(thumb_stamp(&session, &relinked), footage_stamp);
+
+        // So is a file that went missing.
+        let proj = Arc::make_mut(&mut session.project);
+        if let ItemKind::Footage(f) = &mut proj.item_mut(fid).unwrap().kind {
+            f.missing = true;
+        }
+        let missing = session.project.item(fid).unwrap().clone();
+        assert_ne!(thumb_stamp(&session, &missing), thumb_stamp(&session, &relinked));
     }
 
     #[test]
