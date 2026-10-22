@@ -1630,4 +1630,28 @@ mod released_cap_tests {
         assert_eq!(p.released_bytes, TEX_BYTES, "the newest texture is the one kept");
         assert!(p.released.iter().all(|(_, w)| *w == e));
     }
+
+    /// `close` drains only the textures whose encoder is gone: the ones still waiting for a
+    /// newer encoder keep their bytes.
+    #[test]
+    fn close_keeps_bytes_of_still_waiting_textures() {
+        let Some(gpu) = gpu() else {
+            return;
+        };
+        let mut p = Pool::default();
+        let e1 = p.open();
+        p.release(gpu.texture(TEX_W, TEX_H)); // waits for e1, the only open encoder
+        let e2 = p.open();
+        p.release(gpu.texture(TEX_W, TEX_H)); // waits for e2, the newest open encoder
+        p.release(gpu.texture(TEX_W, TEX_H));
+        assert_eq!(p.released.len(), 3);
+        assert_eq!(p.released_bytes, 3 * TEX_BYTES);
+        p.close(e1);
+        assert_eq!(p.released.len(), 2, "the textures waiting for e2 stay");
+        assert_eq!(p.released_bytes, 2 * TEX_BYTES, "close keeps the bytes of the waiting textures");
+        assert_eq!(p.free.get(&(TEX_W, TEX_H)).map_or(0, |v| v.len()), 1, "the drained texture lands in the free list");
+        p.close(e2);
+        assert!(p.released.is_empty() && p.released_bytes == 0, "the last close empties the list");
+        assert_eq!(p.free.get(&(TEX_W, TEX_H)).map_or(0, |v| v.len()), 3);
+    }
 }
