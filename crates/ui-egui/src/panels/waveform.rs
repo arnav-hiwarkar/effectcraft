@@ -369,6 +369,8 @@ mod tests {
         }
         // A panicking build is abandoned and frees its slot instead of leaking it.
         wait_until(|| abandoned.load(Ordering::SeqCst) == 2);
+        // The slot is freed after the abandon call, so wait for it rather than racing it.
+        wait_until(|| q.state.lock().unwrap().running == 0);
         assert_eq!(q.state.lock().unwrap().running, 0);
         // Later submits still run.
         let (tx, rx) = mpsc::channel();
@@ -390,8 +392,8 @@ mod tests {
                 }),
             });
         }
-        // submit pumps synchronously, so the first build fails to spawn, its slot goes back to
-        // 0, and with nobody left to pump the queue the two pending builds are abandoned too.
+        // submit pumps synchronously, so each build fails to spawn and is abandoned on its own
+        // submit; nothing is ever left pending.
         assert_eq!(abandoned.load(Ordering::SeqCst), 3);
         let s = q.state.lock().unwrap();
         assert_eq!(s.running, 0);
