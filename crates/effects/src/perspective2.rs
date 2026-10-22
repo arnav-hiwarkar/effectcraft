@@ -11,7 +11,7 @@ use effectcraft_raster::{Image, Px};
 use rayon::prelude::*;
 
 use crate::util::{Plane, fit_layer, gauss_plane, premul, unpremul};
-use crate::{Buf, EffectCtx, EffectSpec, LayerPixels, num, p, popup, slider};
+use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
     EffectSpec { id, name, category: "Perspective", params, render, gpu: false, float: true }
@@ -51,12 +51,29 @@ fn env_uv(mapping: u32, r: [f64; 3]) -> (f64, f64) {
 }
 
 fn cc_environment(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let env = ctx.layer_param("environment", true).unwrap_or_else(|| LayerPixels { buf: b.clone(), size: ctx.layer_size });
-    let env_img = if ctx.params.b("filterEnvironment") {
-        let s = 2.0 * env.buf.scale;
-        effectcraft_raster::gaussian_blur(&env.buf.img, s, s, true)
-    } else {
-        env.buf.img.clone()
+    let env = ctx.layer_param("environment", true);
+    let filter = ctx.params.b("filterEnvironment");
+    let (es, eo, esz) = match &env {
+        Some(e) => (e.buf.scale, e.buf.offset, e.size),
+        None => (b.scale, b.offset, ctx.layer_size),
+    };
+    let env_img = match env {
+        Some(e) => {
+            if filter {
+                let s = 2.0 * e.buf.scale;
+                effectcraft_raster::gaussian_blur(&e.buf.img, s, s, true)
+            } else {
+                e.buf.img
+            }
+        }
+        None => {
+            if filter {
+                let s = 2.0 * b.scale;
+                effectcraft_raster::gaussian_blur(&b.img, s, s, true)
+            } else {
+                b.img.clone()
+            }
+        }
     };
     let mapping = ctx.params.e("mapping");
     let height = ctx.params.f("height") / 100.0 * 20.0;
@@ -67,11 +84,9 @@ fn cc_environment(ctx: &EffectCtx, mut b: Buf) -> Buf {
     });
     let soft = 1.5 * b.scale.max(0.25);
     let hmap = gauss_plane(&relief, soft, soft);
-    let (es, eo, esz) = (env.buf.scale, env.buf.offset, env.size);
-    let src = b.img.clone();
     b.img.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
-            let a = src.get(x as i64, y as i64)[3];
+            let a = px[3];
             if a <= 0.0 {
                 *px = [0.0; 4];
                 continue;
@@ -224,7 +239,7 @@ pub fn specs() -> Vec<EffectSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EffectEnv, EffectHost, run_fx};
+    use crate::{EffectEnv, EffectHost, LayerPixels, run_fx};
 
     fn img() -> Image {
         crate::util::gen_image(32, 24, |x, y| {
@@ -259,6 +274,42 @@ mod tests {
         for m in 0..3 {
             let o = run_fx("ec.perspective.ccenvironment", &[("mapping", Value::Enum(m))], img(), 0.0, EffectEnv::default());
             assert!(o.img.data.iter().all(|p| p.iter().all(|v| v.is_finite())));
+        }
+    }
+
+    #[test]
+    fn environment_default_env_without_filter_runs_in_place() {
+        let o = run_fx("ec.perspective.ccenvironment", &[("filterEnvironment", Value::Bool(false))], img(), 0.0, EffectEnv::default());
+        assert_eq!(o.img.get(0, 0)[3], 0.0);
+        let again = run_fx("ec.perspective.ccenvironment", &[("filterEnvironment", Value::Bool(false))], img(), 0.0, EffectEnv::default());
+        assert_eq!(o.img, again.img);
+        for m in 0..3 {
+            let res = run_fx(
+                "ec.perspective.ccenvironment",
+                &[("filterEnvironment", Value::Bool(false)), ("mapping", Value::Enum(m))],
+                img(),
+                0.0,
+                EffectEnv::default(),
+            );
+            assert!(res.img.data.iter().all(|p| p.iter().all(|v| v.is_finite())));
+            assert_eq!(res.img.get(0, 0)[3], 0.0);
+        }
+    }
+
+    #[test]
+    fn environment_external_layer_zero_clones_bit_identical() {
+        let env = LayerPixels { buf: Buf { img: Image::filled(16, 8, [0.2, 0.8, 0.4, 1.0]), offset: [0.0; 2], scale: 1.0 }, size: [16.0, 8.0] };
+        let host = Host(env);
+        let e = EffectEnv { host: Some(&host), ..Default::default() };
+        for filter in [true, false] {
+            for m in 0..3 {
+                let params = [("environment", Value::Layer(Some(9))), ("filterEnvironment", Value::Bool(filter)), ("mapping", Value::Enum(m))];
+                let a = run_fx("ec.perspective.ccenvironment", &params, img(), 0.0, e);
+                let b = run_fx("ec.perspective.ccenvironment", &params, img(), 0.0, e);
+                assert_eq!(a.img, b.img);
+                assert_eq!(a.img.get(0, 0)[3], 0.0);
+                assert!(a.img.data.iter().all(|p| p.iter().all(|v| v.is_finite())));
+            }
         }
     }
 
