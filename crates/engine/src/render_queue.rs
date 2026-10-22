@@ -492,7 +492,7 @@ impl Session {
             let inbox = Arc::new(crate::offload::Inbox::default());
             let req = crate::offload::WorkerRequest {
                 id,
-                project: self.project.to_json(),
+                project: self.project.to_json_compact(),
                 files: crate::offload::footage_files(&self.project),
                 job: crate::offload::WorkerJob::Render { items },
             };

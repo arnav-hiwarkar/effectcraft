@@ -54,7 +54,8 @@ use crate::{Event, Session};
 #[serde(rename_all = "camelCase")]
 pub struct WorkerRequest {
     pub id: u64,
-    /// The project ([`Project::to_json`]).
+    /// The project, compact JSON ([`Project::to_json_compact`]): the worker parses it the same
+    /// way, but the request is smaller and quicker to build and to ship.
     pub project: String,
     /// Footage files the job reads; the host ships their bytes before the request.
     pub files: Vec<String>,
@@ -750,7 +751,7 @@ impl Session {
         let id = next_id();
         let inbox = Arc::new(Inbox::default());
         let base = self.project.comp(comp).and_then(|c| c.layer(layer)).and_then(|l| l.props.find_group(uid)).cloned().map(Box::new);
-        let req = WorkerRequest { id, project: self.project.to_json(), files: footage_files(&self.project), job };
+        let req = WorkerRequest { id, project: self.project.to_json_compact(), files: footage_files(&self.project), job };
         off.start(req, inbox.clone())?;
         self.offloaded.push(OffloadedJob {
             id,
@@ -1261,6 +1262,47 @@ mod tests {
         s.redo();
         s.execute("track.analyze", serde_json::json!({"direction": "forward", "wait": true})).ok();
         assert!(s.offloaded.is_empty());
+    }
+
+    /// Keeps the requests handed to the worker (a worker that never replies).
+    #[derive(Default)]
+    struct Capture(Mutex<Vec<WorkerRequest>>);
+    impl Offload for Capture {
+        fn start(&self, req: WorkerRequest, _: Arc<Inbox>) -> Result<(), String> {
+            self.0.lock().unwrap().push(req);
+            Ok(())
+        }
+        fn cancel(&self, _: u64) {}
+    }
+
+    /// A background job ships the project as compact JSON: the worker parses it the same way,
+    /// but the request is smaller and quicker to build and to send.
+    #[test]
+    fn offloaded_requests_carry_compact_project() {
+        // A render job.
+        let cap = Arc::new(Capture::default());
+        let exporter = Arc::new(crate::rq_tests::MockExporter { log: Default::default() });
+        let mut s = Session { exporter: Some(exporter), offload: Some(cap.clone()), ..Default::default() };
+        s.execute("file.openDemoProject", serde_json::json!({})).unwrap();
+        s.execute("renderQueue.add", serde_json::json!({"output": "/x.gif"})).unwrap();
+        s.start_render(false).unwrap();
+        let reqs = cap.0.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(!reqs[0].project.contains('\n'), "the project is compact JSON");
+        assert_eq!(Project::from_json(&reqs[0].project).unwrap(), *s.project);
+        drop(reqs);
+
+        // An analysis.
+        let cap = Arc::new(Capture::default());
+        let (mut s, _, _) = crate::tests_track::setup(crate::tests_track::patch_frames(pose));
+        s.offload = Some(cap.clone());
+        s.execute("track.motion", serde_json::json!({})).unwrap();
+        s.execute("track.setPoint", serde_json::json!({"point": 1, "center": pose(0).0, "featureSize": [36, 36], "searchSize": [80, 80]})).unwrap();
+        s.execute("track.analyze", serde_json::json!({"direction": "forward"})).unwrap();
+        let reqs = cap.0.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(!reqs[0].project.contains('\n'), "the project is compact JSON");
+        assert_eq!(Project::from_json(&reqs[0].project).unwrap(), *s.project);
     }
 
     #[test]
