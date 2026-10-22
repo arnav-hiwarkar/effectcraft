@@ -28,6 +28,30 @@ fn project(s: &mut Session) -> effectcraft_project::ItemId {
     s.active_comp_id().unwrap()
 }
 
+fn still_footage(foot: &std::path::Path) -> effectcraft_project::Footage {
+    effectcraft_project::Footage {
+        path: foot.to_string_lossy().to_string(),
+        kind: effectcraft_project::FootageKind::Still,
+        width: 1,
+        height: 1,
+        pixel_aspect: 1.0,
+        frame_rate: effectcraft_time::FrameRate::FPS_30,
+        native_rate: None,
+        duration: effectcraft_time::Tick::ZERO,
+        has_video: true,
+        has_audio: false,
+        alpha: effectcraft_project::AlphaMode::Ignore,
+        premul_color: [0.0; 3],
+        loop_count: 1,
+        codec: "PNG".into(),
+        missing: false,
+        sequence: vec![],
+        color_profile: None,
+        layer: None,
+        ..Default::default()
+    }
+}
+
 #[test]
 fn disk_cache_settings_persistence_and_invalidation() {
     crate::tests_roto::hold_roto_cache_test_lock();
@@ -74,6 +98,52 @@ fn disk_cache_settings_persistence_and_invalidation() {
     s2.execute_checked("prefs.set", json!({"key": "disk.diskCacheEnabled", "value": false})).unwrap();
     assert!(s2.disk_cache.is_none());
     assert!(s2.layer_cache.disk().is_none());
+}
+
+/// Edits recompute the disk salt only when footage can have changed (perf 40): a property set
+/// is no stat, not even when the footage file is rewritten on disk; footage edits and a project
+/// open recompute it, and the salt keeps following the file contents.
+#[test]
+fn salt_recomputed_only_when_footage_changes() {
+    let dir = folder("salt-on-edit");
+    let mut s = session(&dir);
+    let foot = std::env::temp_dir().join(format!("effectcraft-salt-hold-{}.png", std::process::id()));
+    std::fs::write(&foot, b"one").unwrap();
+    s.edit("add", None, |p, _| {
+        p.add_item("f.png", effectcraft_color::Label::Lavender, None, effectcraft_project::ItemKind::Footage(still_footage(&foot)));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(s.salt_computes, 1, "the salt was computed once for the added footage");
+    project(&mut s); // a comp, a layer, an effect and `prop.set`: no footage touched
+    assert_eq!(s.salt_computes, 1, "edits that touch no footage don't compute it again");
+    let before = effectcraft_render::disk_cache::footage_salt(&s.project);
+    // A file rewritten on disk with the same fields would change the salt; edits don't see it.
+    std::fs::write(&foot, b"two, longer").unwrap();
+    assert_ne!(effectcraft_render::disk_cache::footage_salt(&s.project), before);
+    s.execute("prop.set", json!({"layer": "#1", "path": "effects/#1/blurriness", "value": 20})).unwrap();
+    assert_eq!(s.salt_computes, 1, "a property set didn't re-stat the file");
+    // The refresh points do recompute: invalidation at a reload point, footage edits, project open.
+    s.invalidate_footage_salt();
+    s.bump();
+    assert_eq!(s.salt_computes, 2, "invalidation makes the next bump recompute");
+    s.edit("footage edited", None, |p, _| {
+        for it in p.items.values_mut() {
+            if let effectcraft_project::ItemKind::Footage(f) = &mut it.kind
+                && f.codec == "PNG"
+            {
+                f.codec = "PNG+".into();
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(s.salt_computes, 3, "a footage edit recomputes");
+    assert_ne!(effectcraft_render::disk_cache::footage_salt(&s.project), before, "and the salt follows the fields");
+    let mut p = effectcraft_project::Project::default();
+    p.add_item("other.png", effectcraft_color::Label::Lavender, None, effectcraft_project::ItemKind::Footage(still_footage(&foot)));
+    s.replace_project(p, None);
+    assert_eq!(s.salt_computes, 4, "opening a project recomputes");
 }
 
 #[test]

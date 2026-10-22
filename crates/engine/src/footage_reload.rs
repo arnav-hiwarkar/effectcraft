@@ -154,6 +154,11 @@ fn reload(s: &mut Session, ids: &[ItemId], undoable: bool) -> crate::Result<(usi
         }
     }
     let n = updates.len();
+    if n > 0 {
+        // The files were re-read: their stamps may have moved with no `Footage` field changing,
+        // so the disk salt's cached inputs are stale (perf 40).
+        s.invalidate_footage_salt();
+    }
     if undoable {
         s.edit("Reload Footage", None, |proj, _| {
             for (i, f) in updates {
@@ -233,7 +238,9 @@ pub fn apply_stamps(s: &mut Session, now: Vec<(String, Option<Stamp>)>) -> crate
     if changed.is_empty() {
         return Ok(json!({"files": 0, "reloaded": 0}));
     }
-    // Changed frames of image sequences (their items keep their metadata).
+    // Changed frames of image sequences (their items keep their metadata): the salt's inputs
+    // would look unchanged though the files moved, so forget what it was computed from.
+    s.invalidate_footage_salt();
     forget(s, &changed);
     let files = changed.len();
     s.toast(if reloaded > 0 {

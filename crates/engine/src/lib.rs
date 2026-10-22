@@ -449,6 +449,16 @@ pub struct Session {
     pub layer_cache: Arc<LayerCache>,
     /// The persistent disk cache (Settings ▸ Media & Disk Cache), when enabled.
     pub disk_cache: Option<Arc<effectcraft_render::disk_cache::DiskCache>>,
+    /// The footage items (id and fields, in project order) the disk salt was last computed
+    /// from: `bump` compares against these cheaply (no syscalls) and re-hashes and re-stats the
+    /// files only when footage can have changed, not on every edit (perf 40). Reset with
+    /// [`Session::invalidate_footage_salt`] at refresh points that change a file's stamp without
+    /// changing its fields (project open, reload): public only because Session is built with
+    /// struct-update syntax from other crates.
+    pub salt_inputs: Option<Vec<(ItemId, effectcraft_project::Footage)>>,
+    /// How many times the disk salt was actually recomputed (tests; [`Session::refresh_footage_salt`]).
+    #[cfg(test)]
+    salt_computes: u32,
     /// Settings (Preferences).
     pub prefs: prefs::Prefs,
     /// Bumped whenever settings change (frontends re-apply theme, labels…).
@@ -588,6 +598,9 @@ impl Default for Session {
             journal: vec![],
             layer_cache: Arc::new(LayerCache::default()),
             disk_cache: None,
+            salt_inputs: None,
+            #[cfg(test)]
+            salt_computes: 0,
             prefs: prefs::Prefs::default(),
             prefs_revision: 0,
             config: None,
@@ -737,9 +750,46 @@ impl Session {
             self.saved_revision = self.revision;
         }
         if self.disk_cache.is_some() {
-            self.layer_cache.set_disk_salt(effectcraft_render::disk_cache::footage_salt(&self.project));
+            self.refresh_footage_salt();
         }
         self.events.push(Event::ProjectChanged { revision: self.revision });
+    }
+
+    /// Give the layer cache a fresh disk salt, computing it only when the footage items (which
+    /// the salt stamps in) have changed since last time: every edit bumps, and `footage_salt`
+    /// hashes each item and stats every file of an image sequence, so comparing the items first
+    /// keeps drags off the file system (perf 40). Inputs that went stale on disk (footage
+    /// re-encoded with the same fields) are reset by [`Session::invalidate_footage_salt`] at the
+    /// refresh points that re-read files.
+    fn refresh_footage_salt(&mut self) {
+        let now: Vec<(ItemId, &effectcraft_project::Footage)> = self
+            .project
+            .items
+            .values()
+            .filter_map(|it| match &it.kind {
+                effectcraft_project::ItemKind::Footage(f) => Some((it.id, f)),
+                _ => None,
+            })
+            .collect();
+        let same =
+            self.salt_inputs.as_ref().is_some_and(|old| old.len() == now.len() && old.iter().zip(&now).all(|((oid, of), (nid, nf))| oid == nid && of == *nf));
+        if !same {
+            #[cfg(test)]
+            {
+                self.salt_computes += 1;
+            }
+            let salt = effectcraft_render::disk_cache::footage_salt(&self.project);
+            self.layer_cache.set_disk_salt(salt);
+            self.salt_inputs = Some(now.into_iter().map(|(id, f)| (id, f.clone())).collect());
+        }
+    }
+
+    /// Forget what the disk salt was computed from: the next bump recomputes it from the files.
+    /// Refresh points whose files can change without any `Footage` field moving (project open,
+    /// footage re-read from disk, the disk cache enabled) call this so a re-encode with the same
+    /// metadata still gets fresh layer keys.
+    pub fn invalidate_footage_salt(&mut self) {
+        self.salt_inputs = None;
     }
 
     /// Set a comp's Resolution. As in After Effects it is saved with the project (which becomes
@@ -1172,6 +1222,8 @@ impl Session {
         self.history = History::default();
         self.state = EditorState { snapping: true, view_layout: 1, ..Default::default() };
         self.path = path;
+        // A new project's files can have the same names and fields yet different content.
+        self.invalidate_footage_salt();
         self.bump();
         self.mark_saved();
         let first = self.project.comps().next().map(|(id, _)| *id);

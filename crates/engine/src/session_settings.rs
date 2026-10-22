@@ -132,6 +132,8 @@ impl Session {
             },
         };
         self.layer_cache.set_disk(Some((dc.clone(), footage_salt(&self.project))));
+        // The salt was just computed fresh: the next bump compares its inputs against that.
+        self.salt_inputs = None;
         // Roto Brush / Object Matte segmentations persist there too (held weakly: switching the
         // disk cache off drops it).
         let store: std::sync::Arc<dyn effectcraft_effects::roto::SegStore> = dc.clone();
