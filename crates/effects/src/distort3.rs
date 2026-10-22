@@ -201,7 +201,8 @@ fn cc_power_pin(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let persp = (ctx.params.f("perspective") / 100.0).clamp(0.0, 1.0);
     let fwd = Mat3::square_to_quad(q);
     let Some(inv) = fwd.inverse() else { return b };
-    let src = b.img.clone();
+    // Move the source out instead of cloning: nothing reads `b.img` until the new image is assigned.
+    let src = std::mem::take(&mut b.img);
     let (sc, off) = (b.scale, b.offset);
     let bil = move |u: f64, v: f64| -> (f64, f64) {
         let top = (q[0].x + (q[1].x - q[0].x) * u, q[0].y + (q[1].y - q[0].y) * u);
@@ -1210,6 +1211,57 @@ mod tests {
         // Default corners are the identity either way.
         let id = run("ec.distort.ccpowerpin", &[("unstretch", Value::Bool(true))], im.clone(), &[]);
         assert!(maxd(&id.img, &im) < 1e-4);
+    }
+
+    #[test]
+    fn power_pin_moved_source_paths() {
+        // The source is moved out (`mem::take`), not cloned, so these must behave exactly as when
+        // the effect sampled a copy — and no path may return an emptied buffer.
+        let im = img(64, 48);
+        let right_half = [("topLeft", pt(32.0, 0.0)), ("bottomLeft", pt(32.0, 48.0))];
+        let a = run("ec.distort.ccpowerpin", &right_half, im.clone(), &[]);
+        let b = run("ec.distort.ccpowerpin", &right_half, im.clone(), &[]);
+        assert_eq!(a.img, b.img);
+        assert_eq!((a.img.width, a.img.height), (im.width, im.height));
+        assert_eq!(a.img.get(3, 24)[3], 0.0);
+        assert!(a.img.get(48, 24)[3] > 0.5);
+        // Unstretch fills the layer from the pinned quad.
+        let mut set = [("topLeft", pt(8.0, 6.0)), ("topRight", pt(56.0, 6.0)), ("bottomRight", pt(56.0, 42.0)), ("bottomLeft", pt(8.0, 42.0))].to_vec();
+        set.push(("unstretch", Value::Bool(true)));
+        let a = run("ec.distort.ccpowerpin", &set, im.clone(), &[]);
+        let b = run("ec.distort.ccpowerpin", &set, im.clone(), &[]);
+        assert_eq!(a.img, b.img);
+        assert_eq!((a.img.width, a.img.height), (im.width, im.height));
+        assert!(a.img.get(32, 24)[3] > 0.9);
+        assert!(maxd(&a.img, &im) > 1e-3);
+        // Perspective below 1 blends in the bilinear Newton path.
+        let set = [
+            ("topLeft", pt(5.0, 3.0)),
+            ("topRight", pt(61.0, 10.0)),
+            ("bottomRight", pt(59.0, 47.0)),
+            ("bottomLeft", pt(6.0, 44.0)),
+            ("perspective", num(50.0)),
+        ];
+        let a = run("ec.distort.ccpowerpin", &set, im.clone(), &[]);
+        let b = run("ec.distort.ccpowerpin", &set, im.clone(), &[]);
+        assert_eq!(a.img, b.img);
+        assert_eq!((a.img.width, a.img.height), (im.width, im.height));
+        assert!(a.img.data.iter().all(|p| p.iter().all(|v| v.is_finite())));
+        assert!(a.img.get(32, 24)[3] > 0.5);
+        assert!(maxd(&a.img, &im) > 1e-3);
+        // Corners pushed outside the layer pad the buffer before the pin.
+        let set = [("topLeft", pt(-8.0, -8.0)), ("topRight", pt(72.0, -8.0)), ("bottomRight", pt(72.0, 56.0)), ("bottomLeft", pt(-8.0, 56.0))];
+        let a = run("ec.distort.ccpowerpin", &set, im.clone(), &[]);
+        let b = run("ec.distort.ccpowerpin", &set, im.clone(), &[]);
+        assert_eq!(a.img, b.img);
+        assert_eq!((a.img.width, a.img.height), (82, 66));
+        assert_eq!(a.offset, [9.0, 9.0]);
+        assert!(a.img.get(41, 33)[3] > 0.9);
+        // A degenerate (collinear) quad bails before the move: the input returns unchanged.
+        let degenerate = [("topLeft", pt(10.0, 10.0)), ("topRight", pt(10.0, 10.0)), ("bottomRight", pt(10.0, 10.0)), ("bottomLeft", pt(10.0, 10.0))];
+        let o = run("ec.distort.ccpowerpin", &degenerate, im.clone(), &[]);
+        assert_eq!(o.img, im);
+        assert_eq!(o.offset, [0.0, 0.0]);
     }
 
     #[test]
