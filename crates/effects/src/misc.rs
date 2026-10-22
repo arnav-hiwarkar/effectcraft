@@ -782,13 +782,28 @@ mod tests {
     }
 
     /// Arbitrary Map mode must render identically to the equivalent A & B Colors gradient
-    /// (identity curves = black-to-white, a flat curve = a constant colour).
+    /// (no curves = identity fallback, a flat curve = a constant colour).
     #[test]
     fn glow_arbitrary_map_matches_ab_colors() {
         let run = |vals: &[(&str, Value)]| run_fx("ec.stylize.glow", vals, scene(), 0.0, EffectEnv::default());
         let cmp = |map: Value, ca: Value, cb: Value| {
-            let m = run(&[("colors", Value::Enum(2)), ("arbitraryMap", map), ("operation", Value::Enum(2))]);
-            let ab = run(&[("colors", Value::Enum(1)), ("colorA", ca), ("colorB", cb), ("operation", Value::Enum(2))]);
+            // Threshold 0 keeps every positive pixel glowing; Sawtooth looping gives the
+            // gray/white regions distinct nonzero t values, so the identity fallback is exercised.
+            let m = run(&[
+                ("colors", Value::Enum(2)),
+                ("arbitraryMap", map),
+                ("operation", Value::Enum(2)),
+                ("threshold", num(0.0)),
+                ("colorLooping", Value::Enum(0)),
+            ]);
+            let ab = run(&[
+                ("colors", Value::Enum(1)),
+                ("colorA", ca),
+                ("colorB", cb),
+                ("operation", Value::Enum(2)),
+                ("threshold", num(0.0)),
+                ("colorLooping", Value::Enum(0)),
+            ]);
             assert_eq!(m.offset, ab.offset);
             let (m, a) = (&m.img, &ab.img);
             assert_eq!((m.width, m.height, m.data.len()), (a.width, a.height, a.data.len()));
@@ -797,10 +812,12 @@ mod tests {
                     assert!((x[c] - y[c]).abs() <= 1e-6, "{x:?} vs {y:?}");
                 }
             }
+            // The parity must be between two actual renders, not two all-black buffers.
+            assert!(m.data.iter().any(|p| p[0] > 0.05), "no nonzero red glow: {:?}", m.data.iter().filter(|p| p[0] > 0.0).count());
         };
-        // Empty map (all identity curves) == black-to-white A & B.
+        // Empty map (no curves: identity fallback t) == black-to-white A & B.
         cmp(Value::Str(String::new()), col(0.0, 0.0, 0.0), col(1.0, 1.0, 1.0));
-        // A flat red curve == red-to-red A & B (green/blue stay identity).
+        // A flat red curve == red-to-red A & B (green/blue are constant-zero curves).
         cmp(Value::Str("0,1 1,1|0,0 1,0|0,0 1,0".into()), col(1.0, 0.0, 0.0), col(1.0, 0.0, 0.0));
     }
 }
