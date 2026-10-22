@@ -467,10 +467,9 @@ impl DiskCache {
                 let now_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 if let Ok(mut g) = self.index.lock()
                     && g.touch_at(kind, key, now_ms) == Some(true)
+                    && let Ok(f) = std::fs::File::options().append(true).open(&path)
                 {
-                    if let Ok(f) = std::fs::File::options().append(true).open(&path) {
-                        let _ = f.set_modified(std::time::SystemTime::now());
-                    }
+                    let _ = f.set_modified(std::time::SystemTime::now());
                 }
                 Some(payload)
             }
