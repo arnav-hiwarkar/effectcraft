@@ -375,8 +375,7 @@ fn radial_scale_wipe(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let reverse = ctx.params.b("reverse");
     let maxd = max_corner_dist(&b, c, f64::hypot);
     let hole = done * maxd;
-    let src = b.img.clone();
-    b.img = remap(&src, false, |x, y| {
+    b.img = remap(&b.img, false, |x, y| {
         let (dx, dy) = (x - c.0, y - c.1);
         let r = dx.hypot(dy);
         if reverse {
@@ -405,8 +404,7 @@ fn scale_wipe(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let c = b.to_px(ctx.params.v2("center"));
     let a = ctx.params.f("direction").to_radians();
     let dir = (a.sin(), -a.cos());
-    let src = b.img.clone();
-    b.img = remap(&src, true, |x, y| {
+    b.img = remap(&b.img, true, |x, y| {
         let u = (x - c.0) * dir.0 + (y - c.1) * dir.1;
         if u <= 0.0 {
             return Some((x, y));
@@ -889,5 +887,130 @@ mod tests {
         let soft = run("ec.transition.blockdissolve", &img, &v);
         assert_eq!(frac(&hard), 0);
         assert!(frac(&soft) > 0);
+    }
+
+    /// Reference copy of the original `radial_scale_wipe` (frame cloned before remap).
+    fn radial_scale_wipe_legacy(ctx: &EffectCtx, mut b: Buf) -> Buf {
+        let done = completion(ctx);
+        if done <= 0.0 {
+            return b;
+        }
+        let c = b.to_px(ctx.params.v2("center"));
+        let reverse = ctx.params.b("reverse");
+        let maxd = max_corner_dist(&b, c, f64::hypot);
+        let hole = done * maxd;
+        let src = b.img.clone();
+        b.img = remap(&src, false, |x, y| {
+            let (dx, dy) = (x - c.0, y - c.1);
+            let r = dx.hypot(dy);
+            if reverse {
+                let lim = (1.0 - done) * maxd;
+                if r >= lim || lim <= 1e-9 {
+                    return None;
+                }
+                let k = maxd / lim;
+                Some((c.0 + dx * k, c.1 + dy * k))
+            } else {
+                if r <= hole || maxd - hole <= 1e-9 {
+                    return None;
+                }
+                let rs = (r - hole) * maxd / (maxd - hole);
+                Some((c.0 + dx / r * rs, c.1 + dy / r * rs))
+            }
+        });
+        b
+    }
+
+    /// Reference copy of the original `scale_wipe` (frame cloned before remap).
+    fn scale_wipe_legacy(ctx: &EffectCtx, mut b: Buf) -> Buf {
+        let stretch = ctx.params.f("stretch").max(0.0);
+        if stretch <= 0.0 {
+            return b;
+        }
+        let c = b.to_px(ctx.params.v2("center"));
+        let a = ctx.params.f("direction").to_radians();
+        let dir = (a.sin(), -a.cos());
+        let src = b.img.clone();
+        b.img = remap(&src, true, |x, y| {
+            let u = (x - c.0) * dir.0 + (y - c.1) * dir.1;
+            if u <= 0.0 {
+                return Some((x, y));
+            }
+            let back = u - u / (1.0 + stretch);
+            Some((x - dir.0 * back, y - dir.1 * back))
+        });
+        b
+    }
+
+    #[test]
+    fn radial_scale_wipe_in_place_avoids_clone_and_matches() {
+        let s = find("ec.transition.ccradialscalewipe").unwrap();
+        let images = [ramp(41, 41), Image::filled(20, 15, [0.3, 0.6, 0.9, 1.0]), Image::new(0, 0)];
+        for img in &images {
+            for &done in &[0.0, 15.0, 30.0, 60.0, 85.0, 100.0] {
+                for reverse in [false, true] {
+                    let mut params = Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
+                    for ps in &s.params {
+                        if let (ParamUi::Point, Value::Vec2(f)) = (&ps.ui, &ps.default) {
+                            params.values.insert(ps.id.to_string(), Value::Vec2([f[0] * img.width as f64, f[1] * img.height as f64]));
+                        }
+                    }
+                    params.values.insert("completion".into(), num(done));
+                    params.values.insert("reverse".into(), Value::Bool(reverse));
+                    let ctx = EffectCtx {
+                        params: &params,
+                        time: 0.0,
+                        layer_size: [img.width as f64, img.height as f64],
+                        seed: 7,
+                        adjustment: false,
+                        env: Default::default(),
+                    };
+                    let got = radial_scale_wipe(&ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).img;
+                    let want = radial_scale_wipe_legacy(&ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).img;
+                    assert_eq!((got.width, got.height), (want.width, want.height));
+                    for (a, b) in got.data.iter().zip(&want.data) {
+                        for c in 0..4 {
+                            assert_eq!(a[c].to_bits(), b[c].to_bits());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scale_wipe_in_place_avoids_clone_and_matches() {
+        let s = find("ec.transition.ccscalewipe").unwrap();
+        let images = [ramp(40, 20), Image::filled(25, 10, [0.1, 0.5, 0.8, 1.0]), Image::new(0, 0)];
+        for img in &images {
+            for &stretch in &[0.0, 0.5, 2.0, 10.0, 100.0, 1000.0] {
+                for &angle in &[0.0, 45.0, 90.0, 180.0, 270.0] {
+                    let mut params = Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
+                    for ps in &s.params {
+                        if let (ParamUi::Point, Value::Vec2(f)) = (&ps.ui, &ps.default) {
+                            params.values.insert(ps.id.to_string(), Value::Vec2([f[0] * img.width as f64, f[1] * img.height as f64]));
+                        }
+                    }
+                    params.values.insert("stretch".into(), num(stretch));
+                    params.values.insert("direction".into(), num(angle));
+                    let ctx = EffectCtx {
+                        params: &params,
+                        time: 0.0,
+                        layer_size: [img.width as f64, img.height as f64],
+                        seed: 7,
+                        adjustment: false,
+                        env: Default::default(),
+                    };
+                    let got = scale_wipe(&ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).img;
+                    let want = scale_wipe_legacy(&ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).img;
+                    assert_eq!((got.width, got.height), (want.width, want.height));
+                    for (a, b) in got.data.iter().zip(&want.data) {
+                        for c in 0..4 {
+                            assert_eq!(a[c].to_bits(), b[c].to_bits());
+                        }
+                    }
+                }
+            }
+        }
     }
 }
