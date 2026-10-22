@@ -1,7 +1,7 @@
 //! Content selected by layer parameters participates in the owner's cache key. Keep the
 //! ordinary layer cache (including static self reads), and conservatively decline only
 //! cyclic/over-budget graphs or expressions sampled at unknown times.
-use super::{KeyHasher, hash_debug, hash_values};
+use super::{KeyHasher, hash_debug, hash_mat4, hash_values};
 use crate::EvalCtx;
 use effectcraft_project::{ItemId, ItemKind, Layer, LayerId, LayerSource, LightKind, Node, PropGroup};
 use std::hash::Hash;
@@ -55,7 +55,7 @@ impl Dependencies<'_> {
                             if other.id == layer.id {
                                 // Source/Masks never enter the same stack again. The owner
                                 // key already covers its source and mask properties.
-                                hash_debug(self.h, &ctx.world_matrix(other));
+                                hash_mat4(self.h, &ctx.world_matrix(other));
                             } else {
                                 self.layer(ctx, other)?;
                             }
@@ -143,7 +143,7 @@ impl Dependencies<'_> {
         // editing it (`hash_values` only sees animated ones), so the owner's key needs them too.
         super::hash_overrides(self.h, ctx, layer.id);
         hash_values(self.h, ctx, layer, &layer.props);
-        hash_debug(self.h, &ctx.world_matrix(layer));
+        hash_mat4(self.h, &ctx.world_matrix(layer));
         // A cached owner never runs this layer's effects, so the comp camera and lights its
         // scene-reading effects see belong in the owner's key too (#1252).
         if super::reads_comp_scene(layer) {
