@@ -344,41 +344,66 @@ fn mosaic(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let hb = ctx.params.f("horizontal").round().max(1.0) as usize;
     let vb = ctx.params.f("vertical").round().max(1.0) as usize;
     let (w, h) = (b.img.width as usize, b.img.height as usize);
+    if w == 0 || h == 0 {
+        return b;
+    }
     let cw = (w as f64 / hb as f64).max(1.0);
     let ch = (h as f64 / vb as f64).max(1.0);
-    let src = b.img.clone();
+    let (nx, ny) = ((w as f64 / cw).ceil() as usize, (h as f64 / ch).ceil() as usize);
+    if nx == 0 || ny == 0 {
+        return b;
+    }
+    let Some(total_tiles) = nx.checked_mul(ny) else {
+        return b;
+    };
     if ctx.params.b("sharpColors") {
         // Each tile takes the colour of the pixel at its centre.
+        let mut centers = Vec::with_capacity(total_tiles);
+        for ty in 0..ny {
+            let cy = (ty as f64 + 0.5) * ch;
+            for tx in 0..nx {
+                let cx = (tx as f64 + 0.5) * cw;
+                centers.push(b.img.get_clamped(cx as i64, cy as i64));
+            }
+        }
         b.img.rows_mut().for_each(|(y, row)| {
-            let cy = ((y as f64 / ch).floor() + 0.5) * ch;
+            let ty = ((y as f64 / ch) as usize).min(ny - 1);
             for (x, px) in row.iter_mut().enumerate() {
-                let cx = ((x as f64 / cw).floor() + 0.5) * cw;
-                *px = src.get_clamped(cx as i64, cy as i64);
+                let tx = ((x as f64 / cw) as usize).min(nx - 1);
+                let idx = ty.saturating_mul(nx).saturating_add(tx);
+                if let Some(&c) = centers.get(idx) {
+                    *px = c;
+                }
             }
         });
         return b;
     }
     // Each tile takes the average colour of its region.
-    let (nx, ny) = ((w as f64 / cw).ceil() as usize, (h as f64 / ch).ceil() as usize);
-    let mut sums = vec![[0.0f64; 5]; nx * ny];
+    let mut sums = vec![[0.0f64; 5]; total_tiles];
     for y in 0..h {
         let ty = ((y as f64 / ch) as usize).min(ny - 1);
         for x in 0..w {
             let tx = ((x as f64 / cw) as usize).min(nx - 1);
-            let p = src.get(x as i64, y as i64);
-            let s = &mut sums[ty * nx + tx];
-            for c in 0..4 {
-                s[c] += p[c] as f64;
+            let p = b.img.get(x as i64, y as i64);
+            let idx = ty.saturating_mul(nx).saturating_add(tx);
+            if let Some(s) = sums.get_mut(idx) {
+                s[0] += p[0] as f64;
+                s[1] += p[1] as f64;
+                s[2] += p[2] as f64;
+                s[3] += p[3] as f64;
+                s[4] += 1.0;
             }
-            s[4] += 1.0;
         }
     }
     b.img.rows_mut().for_each(|(y, row)| {
         let ty = ((y as f64 / ch) as usize).min(ny - 1);
         for (x, px) in row.iter_mut().enumerate() {
             let tx = ((x as f64 / cw) as usize).min(nx - 1);
-            let s = sums[ty * nx + tx];
-            *px = [0, 1, 2, 3].map(|c| (s[c] / s[4].max(1.0)) as f32);
+            let idx = ty.saturating_mul(nx).saturating_add(tx);
+            if let Some(s) = sums.get(idx) {
+                let count = s[4].max(1.0);
+                *px = [(s[0] / count) as f32, (s[1] / count) as f32, (s[2] / count) as f32, (s[3] / count) as f32];
+            }
         }
     });
     b
