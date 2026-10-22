@@ -193,13 +193,12 @@ fn camera_shake_deblur(ctx: &EffectCtx, mut b: Buf) -> Buf {
     if choice.iter().all(Option::is_none) {
         return b;
     }
-    let src = b.img.clone();
     // Feathered blending between patch decisions: each pixel mixes the four nearest patch
     // centres bilinearly.
-    let pick = |i: usize, x: usize, y: usize| -> Px {
-        match choice[i] {
-            None => src.data[y * w + x],
-            Some((k, dx, dy)) => neigh[k].0.get_clamped(x as i64 + dx, y as i64 + dy),
+    let pick = |i: usize, x: usize, y: usize, orig: Px| -> Px {
+        match choice.get(i).copied().flatten() {
+            None => orig,
+            Some((k, dx, dy)) => neigh.get(k).map(|(img, _)| img.get_clamped(x as i64 + dx, y as i64 + dy)).unwrap_or(orig),
         }
     };
     b.img.rows_mut().for_each(|(y, row)| {
@@ -207,24 +206,25 @@ fn camera_shake_deblur(ctx: &EffectCtx, mut b: Buf) -> Buf {
         let (y0, ty) = (fy.floor() as usize, (fy - fy.floor()) as f32);
         let y1 = (y0 + 1).min(ny - 1);
         for (x, o) in row.iter_mut().enumerate() {
+            let orig = *o;
             let fx = ((x as f64 + 0.5) / patch as f64 - 0.5).clamp(0.0, (nx - 1) as f64);
             let (x0, tx) = (fx.floor() as usize, (fx - fx.floor()) as f32);
             let x1 = (x0 + 1).min(nx - 1);
             let ids = [y0 * nx + x0, y0 * nx + x1, y1 * nx + x0, y1 * nx + x1];
-            if ids.iter().all(|&i| choice[i].is_none()) {
+            if ids.iter().all(|&i| choice.get(i).copied().flatten().is_none()) {
                 continue;
             }
             let ws = [(1.0 - tx) * (1.0 - ty), tx * (1.0 - ty), (1.0 - tx) * ty, tx * ty];
             let mut acc = [0.0f32; 4];
             for (i, wgt) in ids.iter().zip(ws) {
-                let q = pick(*i, x, y);
+                let q = pick(*i, x, y, orig);
                 for c in 0..4 {
                     acc[c] += q[c] * wgt;
                 }
             }
             if strength != 1.0 {
                 // Strength above 100 % pushes past the substitute (away from the blurry pixel).
-                let s0 = src.data[y * w + x];
+                let s0 = orig;
                 for c in 0..4 {
                     acc[c] = s0[c] + (acc[c] - s0[c]) * strength;
                 }
@@ -386,5 +386,25 @@ mod tests {
         let s1 = run_fx("ec.blur.camerashakedeblur", &[base[0].clone(), base[1].clone()], blurry.clone(), 1.0 / 30.0, env);
         let s2 = run_fx("ec.blur.camerashakedeblur", &[base[0].clone(), base[1].clone(), ("strength", num(200.0))], blurry.clone(), 1.0 / 30.0, env);
         assert!(dist(&s2.img) > dist(&s1.img) * 1.05, "{} vs {}", dist(&s2.img), dist(&s1.img));
+    }
+
+    #[test]
+    fn camera_shake_deblur_in_place_avoids_clone_and_matches() {
+        let host = Shaky;
+        let env = EffectEnv { host: Some(&host), frame_rate: 30.0, ..Default::default() };
+        let blurry = frame(1);
+        let cases: &[&[(&str, Value)]] = &[
+            &[("patchSize", num(8.0)), ("searchRange", num(2.0))],
+            &[("patchSize", num(16.0)), ("searchRange", num(3.0)), ("strength", num(150.0))],
+            &[("patchSize", num(16.0)), ("searchRange", num(3.0)), ("showBlurryFrames", Value::Bool(true))],
+            &[("patchSize", num(12.0)), ("searchRange", num(4.0)), ("shakeSensitivity", num(80.0)), ("strength", num(175.0))],
+            &[("patchSize", num(24.0)), ("searchRange", num(1.0)), ("strength", num(100.0))],
+        ];
+        for params in cases {
+            let res1 = run_fx("ec.blur.camerashakedeblur", params, blurry.clone(), 1.0 / 30.0, env);
+            let res2 = run_fx("ec.blur.camerashakedeblur", params, blurry.clone(), 1.0 / 30.0, env);
+            assert_eq!(res1.img.data, res2.img.data);
+            assert_ne!(res1.img.data, blurry.data);
+        }
     }
 }
