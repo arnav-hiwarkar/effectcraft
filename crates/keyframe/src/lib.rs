@@ -785,6 +785,26 @@ mod tests {
         assert_eq!(cur.coerce_json(&serde_json::json!({"colors": [[0.25, [0.1, 0.2, 0.3, 0.7]]]})), None, "plain JSON needs two colours");
     }
 
+    /// Scalar keyframes interpolate exactly as before: the same arithmetic, the same
+    /// mixed-type fallback, and the same extrapolation at the ends of the track.
+    #[test]
+    fn scalar_lerp_and_evaluation_preserve_semantics() {
+        let a = Value::Scalar(0.0);
+        let b = Value::Scalar(100.0);
+        for (t, expected) in [(-0.5, -50.0), (0.0, 0.0), (0.25, 25.0), (1.0, 100.0), (1.5, 150.0)] {
+            assert_eq!(a.lerp(&b, t), Value::Scalar(expected));
+        }
+        assert_eq!(b.lerp(&a, 0.25), Value::Scalar(75.0));
+        assert_eq!(a.lerp(&Value::Bool(true), 0.5), Value::Scalar(0.5));
+        assert_eq!(a.lerp(&Value::Enum(4), 0.5), Value::Scalar(2.0));
+        let inf = Value::Scalar(f64::INFINITY);
+        assert!(matches!(inf.lerp(&inf, 0.0), Value::Scalar(v) if v.is_nan()));
+        let keys = [Keyframe::new(Tick(0), a), Keyframe::new(Tick(4 * TICKS_PER_SECOND), b)];
+        for (seconds, expected) in [(-1, 0.0), (0, 0.0), (1, 25.0), (4, 100.0), (5, 100.0)] {
+            assert_eq!(evaluate(&keys, Tick(seconds * TICKS_PER_SECOND), false), Some(Value::Scalar(expected)));
+        }
+    }
+
     #[test]
     fn linear_and_hold() {
         let keys = vec![Keyframe::new(s(0.0), Value::Scalar(0.0)), Keyframe::new(s(2.0), Value::Scalar(100.0))];
