@@ -3,6 +3,7 @@
 //! pickers, a small deterministic RNG and per-pixel helpers.
 
 use effectcraft_color::{luminance, rgb_to_hsl};
+use effectcraft_keyframe::Value;
 use effectcraft_raster::{Image, Px};
 use rayon::prelude::*;
 
@@ -492,11 +493,13 @@ pub fn params_key(ctx: &crate::EffectCtx, b: &crate::Buf, salt: u64) -> u64 {
 pub fn params_key_except(ctx: &crate::EffectCtx, b: &crate::Buf, salt: u64, skip: &[&str]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    let mut keys: Vec<&String> = ctx.params.values.keys().filter(|k| !skip.iter().any(|s| k.starts_with(s))).collect();
-    keys.sort();
-    for k in keys {
+    // Sorted by parameter id, so the key does not depend on the map's iteration order.
+    let mut entries: Vec<(&str, &Value)> =
+        ctx.params.values.iter().filter(|(k, _)| !skip.iter().any(|s| k.starts_with(s))).map(|(k, v)| (k.as_str(), v)).collect();
+    entries.sort_by_key(|e| e.0);
+    for (k, v) in entries {
         k.hash(&mut h);
-        format!("{:?}", ctx.params.values[k]).hash(&mut h);
+        hash_value(v, &mut h);
     }
     ctx.seed.hash(&mut h);
     ctx.layer_size[0].to_bits().hash(&mut h);
@@ -504,6 +507,107 @@ pub fn params_key_except(ctx: &crate::EffectCtx, b: &crate::Buf, salt: u64, skip
     b.scale.to_bits().hash(&mut h);
     salt.hash(&mut h);
     h.finish()
+}
+
+/// Hash a parameter value into `h` field by field, without formatting it to text.
+///
+/// The variant is hashed first, so a scalar, an enum and a bool never hash alike; numbers go
+/// in by their exact bits (so `-0.0` and `0.0` differ, as their `Debug` forms did). A text
+/// document is the one exception: it is large and deeply nested, so it keeps the `Debug`
+/// fallback.
+fn hash_value(v: &Value, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    match v {
+        Value::Scalar(x) => {
+            0u8.hash(h);
+            x.to_bits().hash(h);
+        }
+        Value::Vec2(v) => {
+            1u8.hash(h);
+            hash_f64s(v, h);
+        }
+        Value::Vec3(v) => {
+            2u8.hash(h);
+            hash_f64s(v, h);
+        }
+        Value::Color(v) => {
+            3u8.hash(h);
+            hash_f64s(v, h);
+        }
+        Value::Bool(b) => {
+            4u8.hash(h);
+            b.hash(h);
+        }
+        Value::Enum(i) => {
+            5u8.hash(h);
+            i.hash(h);
+        }
+        Value::Path(p) => {
+            6u8.hash(h);
+            p.vertices.len().hash(h);
+            for v in &p.vertices {
+                hash_f64s(v, h);
+            }
+            p.in_tangents.len().hash(h);
+            for v in &p.in_tangents {
+                hash_f64s(v, h);
+            }
+            p.out_tangents.len().hash(h);
+            for v in &p.out_tangents {
+                hash_f64s(v, h);
+            }
+            p.closed.hash(h);
+            p.feather.len().hash(h);
+            for f in &p.feather {
+                f.segment.hash(h);
+                f.t.to_bits().hash(h);
+                f.radius.to_bits().hash(h);
+                f.tension.to_bits().hash(h);
+            }
+        }
+        Value::Text(t) => {
+            7u8.hash(h);
+            format!("{t:?}").hash(h);
+        }
+        Value::Layer(l) => {
+            8u8.hash(h);
+            match l {
+                Some(id) => {
+                    1u8.hash(h);
+                    id.hash(h);
+                }
+                None => 0u8.hash(h),
+            }
+        }
+        Value::Gradient(g) => {
+            9u8.hash(h);
+            g.colors.len().hash(h);
+            for (pos, rgba) in &g.colors {
+                pos.to_bits().hash(h);
+                for c in rgba {
+                    c.to_bits().hash(h);
+                }
+            }
+            g.opacities.len().hash(h);
+            for (pos, alpha) in &g.opacities {
+                pos.to_bits().hash(h);
+                alpha.to_bits().hash(h);
+            }
+        }
+        Value::Str(s) => {
+            10u8.hash(h);
+            s.hash(h);
+        }
+    }
+}
+
+/// Hash a list of numbers by their exact bits.
+fn hash_f64s(xs: &[f64], h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    xs.len().hash(h);
+    for x in xs {
+        x.to_bits().hash(h);
+    }
 }
 
 /// Checkpointed, deterministic, time-seekable simulation cache.
@@ -800,6 +904,136 @@ mod tests {
         let p = Plane { w: 20, h: 10, data: vec![0.25; 200] };
         let g = gauss_plane(&p, 3.0, 2.0);
         assert!(g.data.iter().all(|v| (v - 0.25).abs() < 1e-5));
+    }
+
+    /// The simulation cache key: stable across calls and map order, sensitive to every kind of
+    /// value, blind to the parameters it is told to skip.
+    #[test]
+    fn params_key_stable_and_sensitive() {
+        use effectcraft_keyframe::{FeatherPoint, Gradient, ShapePath, TextDoc};
+
+        let text = |t: &str| {
+            let mut d = TextDoc::default();
+            d.text = t.to_string();
+            Value::Text(Box::new(d))
+        };
+        let path = |dx: f64| {
+            let mut p = ShapePath::rect([10.0, 20.0], 30.0, 40.0);
+            if let Some(v) = p.vertices.first_mut() {
+                v[0] += dx;
+            }
+            p.feather.push(FeatherPoint { segment: 0, t: 0.5, radius: 2.0, tension: 1.0 });
+            Value::Path(p)
+        };
+        let gradient = |shift: f64| {
+            let mut g = Gradient::default();
+            if let Some(stop) = g.colors.first_mut() {
+                stop.0 += shift;
+            }
+            Value::Gradient(g)
+        };
+
+        let base: Vec<(&str, Value)> = vec![
+            ("scalar", Value::Scalar(1.5)),
+            ("vec2", Value::Vec2([1.0, 2.0])),
+            ("vec3", Value::Vec3([1.0, 2.0, 3.0])),
+            ("color", Value::Color([0.1, 0.2, 0.3, 1.0])),
+            ("bool", Value::Bool(true)),
+            ("enum", Value::Enum(3)),
+            ("path", path(0.0)),
+            ("text", text("hello")),
+            ("layer", Value::Layer(Some(7))),
+            ("gradient", gradient(0.0)),
+            ("str", Value::Str("abc".to_string())),
+        ];
+
+        let key = |values: &[(&str, Value)], skip: &[&str]| -> u64 {
+            let params = crate::Params { values: values.iter().map(|(k, v)| (k.to_string(), v.clone())).collect() };
+            let ctx =
+                crate::EffectCtx { params: &params, time: 0.0, layer_size: [1920.0, 1080.0], seed: 7, adjustment: false, env: crate::EffectEnv::default() };
+            let buf = crate::Buf { img: crate::Image::new(4, 4), offset: [0.0, 0.0], scale: 1.0 };
+            params_key_except(&ctx, &buf, 3, skip)
+        };
+
+        let base_key = key(&base, &[]);
+        // Stable across calls, and independent of the order the parameters went into the map.
+        assert_eq!(base_key, key(&base, &[]));
+        let mut reversed = base.clone();
+        reversed.reverse();
+        assert_eq!(base_key, key(&reversed, &[]));
+
+        // Changing any one parameter changes the key.
+        let changes: Vec<(&str, Value)> = vec![
+            ("scalar", Value::Scalar(1.6)),
+            ("vec2", Value::Vec2([1.0, 2.5])),
+            ("vec3", Value::Vec3([1.0, 2.0, 3.5])),
+            ("color", Value::Color([0.1, 0.2, 0.35, 1.0])),
+            ("bool", Value::Bool(false)),
+            ("enum", Value::Enum(4)),
+            ("path", path(0.25)),
+            ("text", text("hellp")),
+            ("layer", Value::Layer(Some(8))),
+            ("gradient", gradient(0.25)),
+            ("str", Value::Str("abd".to_string())),
+        ];
+        for (id, changed) in &changes {
+            let mut variant = base.clone();
+            for (k, v) in variant.iter_mut() {
+                if *k == *id {
+                    *v = changed.clone();
+                }
+            }
+            assert_ne!(key(&variant, &[]), base_key, "{id} change did not change the key");
+        }
+
+        // Different kinds never collide, even when they hold the same number.
+        let one = |v: Value| key(&[("p", v)], &[]);
+        assert_ne!(one(Value::Scalar(1.0)), one(Value::Enum(1)));
+        assert_ne!(one(Value::Scalar(1.0)), one(Value::Bool(true)));
+        assert_ne!(one(Value::Vec2([1.0, 0.0])), one(Value::Vec3([1.0, 0.0, 0.0])));
+        assert_ne!(one(Value::Layer(None)), one(Value::Layer(Some(0))));
+
+        // Skipped parameters are ignored, whatever they hold.
+        let mut skipped = base.clone();
+        skipped.push(("skipMe", Value::Scalar(99.0)));
+        assert_eq!(key(&skipped, &["skip"]), base_key);
+        let mut skipped2 = base.clone();
+        skipped2.push(("skipMe", Value::Scalar(-99.0)));
+        assert_eq!(key(&skipped2, &["skip"]), base_key);
+
+        // -0.0 and 0.0 hash apart (as their Debug forms did): no panic, and no silent
+        // collision — at worst a cache miss.
+        assert_ne!(key(&[("p", Value::Scalar(-0.0))], &[]), key(&[("p", Value::Scalar(0.0))], &[]));
+    }
+
+    /// Timed measurement of [`params_key_except`]: 100,000 calls on a ~60-parameter set and on
+    /// one with a 2,000-point path. Run with `--release -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn params_key_bench() {
+        use effectcraft_keyframe::ShapePath;
+
+        let names: Vec<String> = (0..60).map(|i| format!("p{i}")).collect();
+        let typical: Vec<(&str, Value)> = names.iter().map(|n| n.as_str()).zip((0..60).map(|i| Value::Scalar(f64::from(i) * 0.5))).collect();
+        let pts: Vec<[f64; 2]> = (0..2000).map(|i| [f64::from(i % 97), f64::from(i % 53)]).collect();
+        let mut with_path = typical.clone();
+        with_path.push(("path", Value::Path(ShapePath::polygon(&pts, true))));
+
+        let measure = |values: &[(&str, Value)], label: &str| {
+            let params = crate::Params { values: values.iter().map(|(k, v)| (k.to_string(), v.clone())).collect() };
+            let ctx =
+                crate::EffectCtx { params: &params, time: 0.0, layer_size: [1920.0, 1080.0], seed: 7, adjustment: false, env: crate::EffectEnv::default() };
+            let buf = crate::Buf { img: crate::Image::new(4, 4), offset: [0.0, 0.0], scale: 1.0 };
+            let start = std::time::Instant::now();
+            let mut acc = 0u64;
+            for _ in 0..100_000 {
+                acc ^= params_key_except(&ctx, &buf, 3, &[]);
+            }
+            let ns = start.elapsed().as_nanos() as f64 / 100_000.0;
+            println!("{label}: {ns:.0} ns/call (acc {acc})");
+        };
+        measure(&typical, "60 scalars");
+        measure(&with_path, "60 scalars + 2000-point path");
     }
 
     #[test]
