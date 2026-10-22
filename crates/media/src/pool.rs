@@ -8,10 +8,11 @@ use effectcraft_project::{AlphaMode, Footage, FootageKind, ItemId};
 use effectcraft_raster::{Image, Px};
 use effectcraft_render::{FloatCurve, FootageSource};
 use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
+use filmcraft_frame::VideoFrame;
 use filmcraft_media::{FrameRequest, SharedSource};
 use image::metadata::Orientation;
 
-use crate::convert::{AlphaOp, dynamic_to_image, frame_to_image_in, frame_to_image_scaled, turned};
+use crate::convert::{AlphaOp, dynamic_to_image, frame_pixel_count, frame_to_image_in, frame_to_image_scaled, turned};
 use crate::gif_anim::{self, Anim};
 use crate::{MediaError, Result};
 
@@ -773,6 +774,19 @@ impl Inner {
     #[cfg(target_arch = "wasm32")]
     fn prefetch(self: &Arc<Self>, _footage: &Footage, _t: Tick, _size: Option<(u32, u32)>, _float: FloatCurve) {}
 
+    /// The full-resolution picture of a movie frame, in a recycled buffer when one of the right
+    /// size is spare. The frame's size is checked before the cache's lock is taken and the buffer
+    /// is allocated with the lock released, so a frame whose pixels cannot be allocated is an
+    /// error (remembered as the movie's problem) instead of an abort.
+    fn convert_movie_frame(&self, path: &Arc<str>, codec: &str, vf: &VideoFrame, op: AlphaOp) -> Result<Image> {
+        let count = frame_pixel_count(vf.width, vf.height).inspect_err(|e| self.note_problem(path, codec, e))?;
+        let buf = {
+            let mut cache = lock(&self.cache);
+            cache.lru.take_spare(count)
+        };
+        frame_to_image_in(vf, op, buf).inspect_err(|e| self.note_problem(path, codec, e))
+    }
+
     fn decode(&self, loc: &Loc, footage: &Footage) -> Result<Image> {
         let op = AlphaOp::of(footage, loc.float);
         let path = &loc.key.path;
@@ -824,8 +838,8 @@ impl Inner {
                 {
                     return Ok(turned(img, turn));
                 }
-                let buf = lock(&self.cache).lru.take_spare(vf.width as usize * vf.height as usize);
-                Ok(turned(frame_to_image_in(&vf, op, buf), turn))
+                let img = self.convert_movie_frame(path, &footage.codec, &vf, op)?;
+                Ok(turned(img, turn))
             }
         }
     }
@@ -926,6 +940,8 @@ fn describe_problem(codec: &str, e: &MediaError) -> String {
     let mut detail = match e {
         MediaError::Io(s) | MediaError::Unsupported(s) | MediaError::Decode(s) => s.as_str(),
         MediaError::Cancelled => "the decode was called off",
+        // A frame buffer that cannot be allocated says what to do about it: no codec is at fault.
+        MediaError::FrameBuffer { .. } => return e.to_string(),
     };
     let mut unsupported = matches!(e, MediaError::Unsupported(_));
     while let Some(rest) = ["decode error: ", "unsupported media: ", "unsupported: ", "I/O error: "].iter().find_map(|p| detail.strip_prefix(p)) {
@@ -1162,5 +1178,45 @@ mod tests {
         #[cfg(unix)]
         assert!(!red("slashes.obj", &format!("/{}", dir.join("red.mtl").display())));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A movie frame whose pixels cannot be allocated says so (the footage shows the reason)
+    /// instead of the allocator aborting the app on an impossible size.
+    #[test]
+    fn movie_frame_buffer_failure_is_reported() {
+        use filmcraft_frame::PixelData;
+        let pool = MediaPool::new();
+        let path: Arc<str> = "/huge.mov".into();
+        let op = AlphaOp::new(AlphaMode::Straight, [0.0; 3]);
+        let frame = |w: u32, h: u32, data: Vec<u8>| VideoFrame {
+            width: w,
+            height: h,
+            data: PixelData::Rgba8(Arc::new(data)),
+            color: filmcraft_color::ColorInfo::REC709,
+            par: (1, 1),
+            pts: filmcraft_time::Tick::ZERO,
+        };
+        // An impossible frame: the pixel count overflows the address space.
+        let huge = frame(u32::MAX, u32::MAX, Vec::new());
+        let e = pool.inner.convert_movie_frame(&path, "H.264", &huge, op).expect_err("an impossible frame fails");
+        let text = "cannot allocate 4294967295 x 4294967295 movie frame buffer; reduce frame size or free memory";
+        assert_eq!(e.to_string(), text);
+        assert!(matches!(&e, MediaError::FrameBuffer { width, height, source: None } if *width == u32::MAX && *height == u32::MAX), "{e:?}");
+        // The footage shows the same reason.
+        let footage = Footage { path: path.to_string(), kind: FootageKind::Video, width: u32::MAX, height: u32::MAX, has_video: true, ..Default::default() };
+        assert_eq!(pool.problem(&footage).as_deref(), Some(text));
+        // A valid frame is converted as before, into a recycled buffer of the right size.
+        let red = frame(1, 1, vec![255, 0, 0, 255]);
+        let img = pool.inner.convert_movie_frame(&path, "H.264", &red, op).expect("a 1×1 frame fits");
+        assert_eq!(img.data, vec![[1.0, 0.0, 0.0, 1.0]]);
+        // A recycled buffer of another frame's pixels is overwritten, not reused.
+        let stale = vec![[0.0, 1.0, 0.0, 1.0]];
+        let img = frame_to_image_in(&red, op, stale).expect("a 1×1 frame fits");
+        assert_eq!(img.data, vec![[1.0, 0.0, 0.0, 1.0]]);
+        // An empty frame holds no pixels.
+        for (w, h) in [(0u32, 0u32), (0, 1), (1, 0)] {
+            let img = pool.inner.convert_movie_frame(&path, "H.264", &frame(w, h, Vec::new()), op).expect("an empty frame converts");
+            assert!(img.data.is_empty(), "{w}×{h}");
+        }
     }
 }
