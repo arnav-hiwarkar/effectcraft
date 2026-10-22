@@ -1456,6 +1456,21 @@ mod tests {
         assert_eq!(mixed.pixels, vec![egui::Color32::from_rgba_premultiplied(128, 128, 128, 255)]);
     }
 
+    /// A frame that fits the texture limit is shared with the texture, not copied; a frame over
+    /// the limit is averaged down exactly as the owned path does.
+    #[test]
+    fn fit_shared_texture_by_shares_a_frame_that_fits() {
+        let img = Arc::new(egui::ColorImage::new([16, 16], vec![egui::Color32::WHITE; 256]));
+        let egui::ImageData::Color(shared) = fit_shared_texture_by(&img, 64, 1);
+        assert!(Arc::ptr_eq(&shared, &img), "a frame within the limit must be shared, not copied");
+        assert_eq!(shared.size, [16, 16]);
+        // 16×16 into 4×4: each texel averages a 4×4 block.
+        let egui::ImageData::Color(fitted) = fit_shared_texture_by(&img, 4, 1);
+        assert!(!Arc::ptr_eq(&fitted, &img), "a frame over the limit is averaged down, not shared");
+        assert_eq!(fitted.size, [4, 4]);
+        assert_eq!(fitted.pixels, vec![egui::Color32::WHITE; 16]);
+    }
+
     #[test]
     fn retirement_reaches_existing_workers_and_keeps_cpu_frames_and_completion_live() {
         let frames = Frames::default();
