@@ -894,21 +894,21 @@ mod tests {
         assert!(sum(cc) > sum(plain) + 0.1 && (sum(cc) - sum(g)).abs() < 1e-4, "{plain:?} {cc:?}");
     }
     #[test]
-    fn linear_color_key_in_place_all_views() {
+    fn color_difference_key_in_place_all_views() {
         let base_img = green_screen();
         // View 0: pass through unmodified.
-        let v0 = run("ec.key.linearcolor", &[("keyColor", green()), ("view", Value::Enum(0))], base_img.clone());
+        let v0 = run("ec.key.colordifference", &[("keyColor", green()), ("view", Value::Enum(0))], base_img.clone());
         assert_eq!(v0.data, base_img.data);
 
         // View 7 / default: final output keyed in place.
-        let final_out = run("ec.key.linearcolor", &[("keyColor", green()), ("view", Value::Enum(7))], base_img.clone());
+        let final_out = run("ec.key.colordifference", &[("keyColor", green()), ("view", Value::Enum(7))], base_img.clone());
         // Green background is removed (alpha ~ 0), red foreground is preserved unmutated.
         assert!(final_out.get(2, 2)[3] < 0.01);
         assert_eq!(final_out.get(12, 2), base_img.get(12, 2));
 
         // Matte views 1..=6 produce opaque greyscale mattes.
         for mode in 1..=6 {
-            let out = run("ec.key.linearcolor", &[("keyColor", green()), ("view", Value::Enum(mode))], base_img.clone());
+            let out = run("ec.key.colordifference", &[("keyColor", green()), ("view", Value::Enum(mode))], base_img.clone());
             assert!(out.data.iter().all(|p| (p[3] - 1.0).abs() < 1e-6));
             // Green screen should produce near-black matte, red foreground near-white matte.
             assert!(out.get(2, 2)[0] < 0.05);
@@ -916,7 +916,7 @@ mod tests {
         }
 
         // View 8: four-up quadrant mode.
-        let four_up = run("ec.key.linearcolor", &[("keyColor", green()), ("view", Value::Enum(8))], base_img.clone());
+        let four_up = run("ec.key.colordifference", &[("keyColor", green()), ("view", Value::Enum(8))], base_img.clone());
         // Top-left (view 2), top-right (view 4), bottom-left (view 6) are opaque mattes.
         assert_eq!(four_up.get(2, 2)[3], 1.0);
         assert_eq!(four_up.get(12, 2)[3], 1.0);
