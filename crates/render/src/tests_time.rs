@@ -147,3 +147,39 @@ fn input_keys_ignore_later_effects() {
     set(&mut p, "effects/#1/blurriness", 8.0);
     assert_ne!(key(&p).0, one);
 }
+
+/// The input key of a layer covers a prefix of its effects stack, not a copy of it: a layer
+/// with a second effect has the same input key as the same layer without it, and a keyframe in
+/// that second effect doesn't change the key either.
+#[test]
+fn input_key_prefix_matches_truncated_stack() {
+    let (mut p, cid) = scene(Some(("ec.blur.gaussian", &[("blurriness", Value::Scalar(4.0))])));
+    {
+        let spec = effectcraft_effects::find("ec.stylize.mosaic").unwrap();
+        let mut next = p.next_id;
+        let g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [200.0, 100.0]);
+        p.next_id = next;
+        p.comp_mut(cid).unwrap().layers[0].props.sub_mut("effects").unwrap().children.push(g.into());
+    }
+    let key = |p: &Project| {
+        let comp = p.comp(cid).unwrap();
+        let ctx = crate::EvalCtx { project: p, comp_id: cid, comp, time: Tick::from_seconds_f64(0.5), expr: None, footage: None };
+        crate::cache::input_key(&ctx, &comp.layers[0], 1.0, false, false, 1)
+    };
+    let full = key(&p);
+    assert!(full.is_some());
+    let keyframe = |p: &mut Project, path: &str| {
+        let prop = p.comp_mut(cid).unwrap().layers[0].props.prop_mut(path).unwrap();
+        prop.keys = vec![Keyframe::new(Tick::ZERO, Value::Scalar(0.0)), Keyframe::new(Tick::from_seconds_f64(1.0), Value::Scalar(12.0))];
+    };
+    // A keyframe in the second effect is not part of the prefix: the key doesn't change.
+    keyframe(&mut p, "effects/#2/horizontal");
+    assert_eq!(key(&p), full, "the second effect doesn't change the input to it");
+    // The same layer without its second effect has the same input key: the key covers the
+    // prefix of the stack, not the whole stack.
+    p.comp_mut(cid).unwrap().layers[0].props.sub_mut("effects").unwrap().children.pop();
+    assert_eq!(key(&p), full);
+    // A keyframe in the first effect does change it.
+    keyframe(&mut p, "effects/#1/blurriness");
+    assert_ne!(key(&p), full);
+}

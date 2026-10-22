@@ -468,15 +468,47 @@ fn group_has(g: &PropGroup, match_id: &str) -> bool {
 /// at the context time. The static structure is hashed separately.
 fn hash_values(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, g: &PropGroup) {
     for c in &g.children {
-        match c {
-            Node::Prop(p) => {
-                if !p.keys.is_empty() || p.has_expression() {
-                    p.uid.hash(h);
-                    hash_debug(h, &ctx.value(layer, p));
-                }
+        hash_value_node(h, ctx, layer, c);
+    }
+}
+
+/// [`hash_values`] for a single node of a group.
+fn hash_value_node(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, node: &Node) {
+    match node {
+        Node::Prop(p) => {
+            if !p.keys.is_empty() || p.has_expression() {
+                p.uid.hash(h);
+                hash_debug(h, &ctx.value(layer, p));
             }
-            Node::Group(sub) => hash_values(h, ctx, layer, sub),
         }
+        Node::Group(sub) => hash_values(h, ctx, layer, sub),
+    }
+}
+
+/// The children of `g` in the prefix a layer's input runs: its props (always) and its first `n`
+/// child groups.
+fn prefix_children(g: &PropGroup, n: usize) -> impl Iterator<Item = &Node> {
+    let mut seen = 0usize;
+    g.children.iter().filter(move |c| match c {
+        Node::Prop(_) => true,
+        Node::Group(_) => {
+            seen += 1;
+            seen <= n
+        }
+    })
+}
+
+/// Hash the prefix of the layer's effects group its input runs (see [`input_key`]): the group's
+/// own header and its first `n` child groups (and their props), by reference — the stack is
+/// never copied (#65). The key's value changes with the hashing scheme; the keys live in memory
+/// only, so nothing depends on them across versions.
+fn hash_group_prefix(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, g: &PropGroup, n: usize) {
+    hash_debug(h, &(&g.uid, &g.match_id, &g.name, &g.kind, &g.enabled, &g.label));
+    for c in prefix_children(g, n) {
+        hash_debug(h, c);
+    }
+    for c in prefix_children(g, n) {
+        hash_value_node(h, ctx, layer, c);
     }
 }
 
@@ -597,17 +629,7 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
         if let (Some(n), Node::Group(g)) = (effects, c)
             && g.match_id == "effects"
         {
-            let mut first = g.clone();
-            let mut seen = 0;
-            first.children.retain(|e| match e {
-                Node::Prop(_) => true,
-                Node::Group(_) => {
-                    seen += 1;
-                    seen <= n
-                }
-            });
-            hash_debug(&mut h, &first);
-            hash_values(&mut h, ctx, layer, &first);
+            hash_group_prefix(&mut h, ctx, layer, g, n);
             continue;
         }
         // Static structure: values, keyframes, expressions, enabled flags, effect ids, modes.
