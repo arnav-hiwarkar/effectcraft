@@ -192,7 +192,26 @@ impl EssentialGraphics {
         out
     }
     pub fn find(&self, id: u64) -> Option<&EgControl> {
-        self.flat().into_iter().find(|c| c.id == id)
+        let mut pending = self.controls.as_slice();
+        let mut stack: Vec<&[EgControl]> = Vec::new();
+        loop {
+            let Some((c, rest)) = pending.split_first() else {
+                pending = stack.pop()?;
+                continue;
+            };
+            if c.id == id {
+                return Some(c);
+            }
+            pending = rest;
+            if let EgKind::Group { children } = &c.kind
+                && !children.is_empty()
+            {
+                if !pending.is_empty() {
+                    stack.push(pending);
+                }
+                pending = children;
+            }
+        }
     }
     pub fn find_mut(&mut self, id: u64) -> Option<&mut EgControl> {
         fn go(v: &mut [EgControl], id: u64) -> Option<&mut EgControl> {
@@ -843,4 +862,42 @@ pub fn dependencies(project: &Project, comp: ItemId) -> Vec<ItemId> {
     }
     out.sort();
     out
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::*;
+
+    fn control(id: u64, name: &str, kind: EgKind) -> EgControl {
+        EgControl { id, name: name.into(), kind, as_type: None }
+    }
+
+    fn comment() -> EgKind {
+        EgKind::Comment { text: String::new() }
+    }
+
+    fn sample() -> EssentialGraphics {
+        EssentialGraphics {
+            name: String::new(),
+            controls: vec![
+                control(7, "group", EgKind::Group { children: vec![control(7, "child", comment()), control(9, "nested", comment())] }),
+                control(9, "root", comment()),
+                control(10, "mirror", EgKind::Mirror { of: 9 }),
+                control(11, "orphan", EgKind::Mirror { of: 99 }),
+                control(12, "self", EgKind::Mirror { of: 12 }),
+            ],
+        }
+    }
+
+    #[test]
+    fn find_preserves_depth_first_and_mirrors() {
+        let eg = sample();
+        assert_eq!(eg.find(7).map(|c| c.name.as_str()), Some("group"));
+        assert_eq!(eg.find(9).map(|c| c.name.as_str()), Some("nested"));
+        assert_eq!(eg.find(99), None);
+        assert_eq!(EssentialGraphics::default().find(7), None);
+        assert_eq!(eg.resolve(10).map(|c| c.name.as_str()), Some("nested"));
+        assert_eq!(eg.resolve(11), None);
+        assert_eq!(eg.resolve(12), None);
+    }
 }
