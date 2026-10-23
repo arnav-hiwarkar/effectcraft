@@ -298,6 +298,13 @@ fn optics_compensation(ctx: &EffectCtx, mut b: Buf) -> Buf {
 // ---------------------------------------------------------------- Magnify
 
 fn magnify(ctx: &EffectCtx, mut b: Buf) -> Buf {
+    let op = (ctx.params.f("opacity") / 100.0) as f32;
+    // Blending Mode: index 0 is "None" (only the magnified area, transparent around it).
+    let mode = ctx.params.e("blendingMode") as usize;
+    let blend = MAGNIFY_MODES.get(mode.wrapping_sub(1)).copied();
+    if op <= 0.0 && blend.is_some() {
+        return b;
+    }
     let square = ctx.params.e("shape") == 1;
     let c = b.to_px(ctx.params.v2("center"));
     let mag = (ctx.params.f("magnification") / 100.0).max(0.01);
@@ -310,11 +317,7 @@ fn magnify(ctx: &EffectCtx, mut b: Buf) -> Buf {
     if link == 2 {
         feather *= mag;
     }
-    let op = (ctx.params.f("opacity") / 100.0) as f32;
     let scaling = ctx.params.e("scaling");
-    // Blending Mode: index 0 is "None" (only the magnified area, transparent around it).
-    let mode = ctx.params.e("blendingMode") as usize;
-    let blend = MAGNIFY_MODES.get(mode.wrapping_sub(1)).copied();
     if ctx.params.b("resizeLayer") && link == 0 && !ctx.adjustment {
         // Let the magnified area extend past the layer edges.
         let (lx, ly, lw, lh) = layer_rect(ctx, &b);
@@ -677,12 +680,15 @@ fn page_turn(ctx: &EffectCtx, mut b: Buf) -> Buf {
 // ---------------------------------------------------------------- CC Tiler / CC Griddler
 
 fn cc_tiler(ctx: &EffectCtx, mut b: Buf) -> Buf {
+    let blend = (ctx.params.f("blendWithOriginal") / 100.0) as f32;
+    if blend >= 1.0 {
+        return b;
+    }
     let s = (ctx.params.f("scale") / 100.0).max(0.001);
     if !ctx.adjustment {
         b.pad(layer_cover_pad(ctx, [b.img.width, b.img.height], b.offset, b.scale));
     }
     let c = b.to_px(ctx.params.v2("center"));
-    let blend = (ctx.params.f("blendWithOriginal") / 100.0) as f32;
     let (x0, y0, w, h) = layer_rect(ctx, &b);
     let (w, h) = (w.max(1.0), h.max(1.0));
     let src = b.img.clone();
@@ -996,6 +1002,20 @@ mod tests {
         assert!(max_diff(&run("ec.distort.cctiler", &[("scale", num(100.0))], img.clone()).img, &img) < 1e-6);
         let o = run("ec.distort.cctiler", &[], img.clone());
         assert!(o.img.data.iter().all(|p| p[3] > 0.99));
+    }
+
+    #[test]
+    fn magnify_zero_opacity_and_tiler_full_blend_identity() {
+        let img = test_img(32, 24);
+        let norm = run("ec.distort.magnify", &[("opacity", num(0.0)), ("blendingMode", Value::Enum(1))], img.clone());
+        assert_eq!(norm.img, img);
+        let add = run("ec.distort.magnify", &[("opacity", num(0.0)), ("blendingMode", Value::Enum(2))], img.clone());
+        assert_eq!(add.img, img);
+        let none = run("ec.distort.magnify", &[("opacity", num(0.0)), ("blendingMode", Value::Enum(0))], img.clone());
+        assert_ne!(none.img, img);
+        assert!(none.img.data.iter().all(|p| p[3] < 1e-6));
+        let tiler = run("ec.distort.cctiler", &[("blendWithOriginal", num(100.0))], img.clone());
+        assert_eq!(tiler.img, img);
     }
 
     #[test]
