@@ -685,6 +685,7 @@ mod tests {
         let painted = run_fx("ec.key.innerouter", &fg, img, 0.0, env).img;
         assert!(painted.get(27, 5)[3] > 0.9 && painted.get(27, 2)[3] < 0.1);
     }
+
     #[test]
     fn inner_outer_key_in_place_blend_with_original() {
         let img = Image::filled(20, 20, [0.8, 0.2, 0.2, 1.0]);
