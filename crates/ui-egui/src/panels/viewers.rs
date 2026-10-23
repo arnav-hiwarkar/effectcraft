@@ -318,11 +318,14 @@ mod tests {
         }
     }
 
-    /// The image a texture was uploaded with.
-    fn uploaded(out: &egui::FullOutput, tex: egui::TextureId) -> Arc<egui::ColorImage> {
+    /// The image a texture was uploaded with. Its other deltas are cleared: dropping a
+    /// `TexturesDelta` with unapplied deltas panics.
+    fn uploaded(mut out: egui::FullOutput, tex: egui::TextureId) -> Arc<egui::ColorImage> {
         let delta = out.textures_delta.set.get(&tex).and_then(|d| d.first()).expect("the viewer's texture was uploaded");
         let egui::ImageData::Color(img) = &delta.image;
-        img.clone()
+        let img = img.clone();
+        out.textures_delta.clear();
+        img
     }
 
     /// A passive viewer uploads the frame it shows instead of copying it (#54): copying a 4K
@@ -331,8 +334,9 @@ mod tests {
     fn passive_viewer_uploads_the_frame_instead_of_copying_it() {
         let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
         let ctx = egui::Context::default();
-        // The first frame gives the context its input (the renderer's texture limit).
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        // The first frame gives the context its input (the renderer's texture limit). Its font
+        // atlas upload is not checked here.
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
         let key = FrameKey { revision: 0, content: 1, comp: 1, frame: 0, scale: 1000, view: 0, opts: 0 };
 
         // A new texture: the frame is uploaded as it is.
@@ -340,23 +344,28 @@ mod tests {
         set_texture(&mut app, &ctx, 1, key, FrameImage::Cpu(first.clone()), None, 0);
         let tex = texture_id(&app, 1);
         let out = ctx.run_ui(egui::RawInput::default(), |_| {});
-        assert!(Arc::ptr_eq(&uploaded(&out, tex), &first), "the passive viewer must upload the frame it shows");
+        assert!(Arc::ptr_eq(&uploaded(out, tex), &first), "the passive viewer must upload the frame it shows");
 
         // The next frame of the same size: the texture is reused, and still holds the frame.
         let second = Arc::new(egui::ColorImage::new([16, 16], vec![egui::Color32::WHITE; 256]));
         set_texture(&mut app, &ctx, 1, FrameKey { frame: 1, ..key }, FrameImage::Cpu(second.clone()), None, 0);
         let out = ctx.run_ui(egui::RawInput::default(), |_| {});
         assert_eq!(texture_id(&app, 1), tex, "the texture of the same size is reused");
-        assert!(Arc::ptr_eq(&uploaded(&out, tex), &second), "the reused texture must hold the frame it shows");
+        assert!(Arc::ptr_eq(&uploaded(out, tex), &second), "the reused texture must hold the frame it shows");
 
         // A frame wider than the texture limit (2048) is averaged down, as it was before.
         let wide = Arc::new(egui::ColorImage::new([4096, 64], vec![egui::Color32::WHITE; 4096 * 64]));
         set_texture(&mut app, &ctx, 1, FrameKey { frame: 2, ..key }, FrameImage::Cpu(wide.clone()), None, 0);
         let fitted = texture_id(&app, 1);
         let out = ctx.run_ui(egui::RawInput::default(), |_| {});
-        let image = uploaded(&out, fitted);
+        let image = uploaded(out, fitted);
         assert_eq!(image.size, [2048, 32]);
         assert!(!Arc::ptr_eq(&image, &wide), "a frame over the texture limit is averaged down, not shared");
         assert_eq!(image.pixels, vec![egui::Color32::WHITE; 2048 * 32]);
+
+        // Free the viewer's texture and flush the free: the texture manager panics when it is
+        // dropped with unapplied deltas.
+        app.passive_tex.clear();
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
     }
 }
