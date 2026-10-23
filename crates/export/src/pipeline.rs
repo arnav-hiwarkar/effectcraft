@@ -521,6 +521,33 @@ mod tests {
     }
 
     #[test]
+    fn cpu_only_frames_respect_cpu_inflight_cap() {
+        // No GPU cap (Software Only): CPU frames still run at most CPU_INFLIGHT_CAP at once.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        let (now, max) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let out = pool.install(|| {
+            map_frames_while(
+                (0..24).collect(),
+                None,
+                || true,
+                |k| {
+                    let c = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    max.fetch_max(c, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    now.fetch_sub(1, Ordering::SeqCst);
+                    k * 10
+                },
+                |_, v| v,
+            )
+        });
+        assert_eq!(out, (0..24).map(|k| k * 10).collect::<Vec<_>>());
+        let peak = max.load(Ordering::SeqCst);
+        assert!(peak <= CPU_INFLIGHT_CAP, "CPU-only concurrency was {peak}, expected <= {CPU_INFLIGHT_CAP}");
+        assert!(peak > 1, "CPU-only frames ran one at a time");
+    }
+
+    #[test]
     fn frames_render_in_parallel_once_the_gpu_stops() {
         // Every frame after the GPU stopped falls back to the CPU: the cap no longer applies.
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
