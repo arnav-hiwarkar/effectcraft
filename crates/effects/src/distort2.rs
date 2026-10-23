@@ -165,6 +165,9 @@ fn displacement_map(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let vs = src_at(ctx.params.e("useForVertical"));
     let mh = ctx.params.f("maxHorizontal") * b.scale;
     let mv = ctx.params.f("maxVertical") * b.scale;
+    if (mh == 0.0 && mv == 0.0) || (hs == Src::Off && vs == Src::Off) {
+        return b;
+    }
     let wrap = ctx.params.b("wrapPixelsAround");
     if ctx.params.b("expandOutput") && !wrap && !ctx.adjustment {
         b.pad(mh.abs().max(mv.abs()).ceil() as u32);
@@ -173,22 +176,22 @@ fn displacement_map(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let layer = ctx.layer_param("displacementMapLayer", false);
     let behavior = ctx.params.e("displacementMapBehavior");
     let map_size = layer.as_ref().map(|o| o.size);
-    let map = match layer {
+    let map_layer = match layer {
         Some(o) => match behavior {
-            1 => fit_layer(ctx, &b, &o, true),
+            1 => Some(fit_layer(ctx, &b, &o, true)),
             2 => {
                 let (os, ls) = (o.size, ctx.layer_size);
                 let (dx, dy) = ((os[0] - ls[0]) * 0.5, (os[1] - ls[1]) * 0.5);
                 let inv = 1.0 / b.scale.max(1e-9);
-                crate::util::gen_image(b.img.width, b.img.height, |x, y| {
+                Some(crate::util::gen_image(b.img.width, b.img.height, |x, y| {
                     let qx = ((x as f64 + 0.5 - b.offset[0]) * inv + dx).rem_euclid(os[0].max(1.0));
                     let qy = ((y as f64 + 0.5 - b.offset[1]) * inv + dy).rem_euclid(os[1].max(1.0));
                     o.buf.img.sample_bilinear_clamped(qx * o.buf.scale + o.buf.offset[0], qy * o.buf.scale + o.buf.offset[1])
-                })
+                }))
             }
-            _ => fit_layer(ctx, &b, &o, false),
+            _ => Some(fit_layer(ctx, &b, &o, false)),
         },
-        None => b.img.clone(),
+        None => None,
     };
     // Center Map: pixels outside the (smaller) map are not displaced.
     let (scale, offset) = (b.scale, b.offset);
@@ -205,6 +208,10 @@ fn displacement_map(ctx: &EffectCtx, mut b: Buf) -> Buf {
         }
     };
     let src = b.img.clone();
+    let map = match &map_layer {
+        Some(m) => m,
+        None => &src,
+    };
     let (w, h) = (src.width as f64, src.height as f64);
     map_xy(&mut b.img, |x, y, px| {
         if outside(x, y) {
@@ -1077,6 +1084,61 @@ mod tests {
         // Expand Output grows the layer by the maximum displacement.
         let o = run("ec.distort.displacementmap", &[("maxHorizontal", num(6.0))], img.clone());
         assert_eq!((o.img.width, o.img.height), (32 + 12, 24 + 12));
+    }
+
+    #[test]
+    fn displacement_map_neutral_skips_processing() {
+        let img = test_img(32, 24);
+        let o_zero =
+            run("ec.distort.displacementmap", &[("maxHorizontal", num(0.0)), ("maxVertical", num(0.0)), ("expandOutput", Value::Bool(true))], img.clone());
+        assert_eq!(o_zero.img, img);
+        assert_eq!((o_zero.img.width, o_zero.img.height), (32, 24));
+
+        let o_off = run(
+            "ec.distort.displacementmap",
+            &[
+                ("useForHorizontal", Value::Enum(10)),
+                ("useForVertical", Value::Enum(10)),
+                ("maxHorizontal", num(5.0)),
+                ("maxVertical", num(5.0)),
+                ("expandOutput", Value::Bool(true)),
+            ],
+            img.clone(),
+        );
+        assert_eq!(o_off.img, img);
+        assert_eq!((o_off.img.width, o_off.img.height), (32, 24));
+    }
+
+    #[test]
+    fn displacement_map_none_layer_matches_self_map() {
+        let img = test_img(32, 24);
+        struct MatchingHost(Image);
+        impl crate::EffectHost for MatchingHost {
+            fn layer(&self, _: u64, _: bool) -> Option<crate::LayerPixels> {
+                Some(crate::LayerPixels { buf: Buf { img: self.0.clone(), offset: [0.0; 2], scale: 1.0 }, size: [self.0.width as f64, self.0.height as f64] })
+            }
+            fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+                None
+            }
+        }
+        let host = MatchingHost(img.clone());
+        let s = crate::find("ec.distort.displacementmap").unwrap();
+        let mut params_none = Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
+        params_none.values.insert("expandOutput".into(), Value::Bool(false));
+        params_none.values.insert("maxHorizontal".into(), num(3.0));
+        params_none.values.insert("maxVertical".into(), num(2.0));
+
+        let mut params_some = params_none.clone();
+        params_some.values.insert("displacementMapLayer".into(), Value::Layer(Some(1)));
+
+        let ctx_none = EffectCtx { params: &params_none, time: 0.0, layer_size: [32.0, 24.0], seed: 1, adjustment: false, env: Default::default() };
+        let o_none = crate::apply(s, &ctx_none, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 });
+
+        let env_some = crate::EffectEnv { host: Some(&host), ..Default::default() };
+        let ctx_some = EffectCtx { params: &params_some, time: 0.0, layer_size: [32.0, 24.0], seed: 1, adjustment: false, env: env_some };
+        let o_some = crate::apply(s, &ctx_some, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 });
+
+        assert_eq!(o_none.img, o_some.img);
     }
 
     #[test]
