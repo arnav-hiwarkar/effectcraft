@@ -565,6 +565,9 @@ fn photo_filter(ctx: &EffectCtx, mut b: Buf) -> Buf {
 fn vibrance(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let vib = ctx.params.f("vibrance") as f32 / 100.0;
     let sat = ctx.params.f("saturation") as f32 / 100.0;
+    if vib == 0.0 && sat == 0.0 {
+        return b;
+    }
     b.img.map_straight(|c| {
         let (h, s, l) = rgb_to_hsl(c[0], c[1], c[2]);
         let s = (s * (1.0 + sat) + vib * (1.0 - s) * s.min(0.5)).clamp(0.0, 1.0);
@@ -579,6 +582,9 @@ fn color_balance(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let sh = [g("shadowRed"), g("shadowGreen"), g("shadowBlue")];
     let md = [g("midRed"), g("midGreen"), g("midBlue")];
     let hl = [g("hiRed"), g("hiGreen"), g("hiBlue")];
+    if sh == [0.0; 3] && md == [0.0; 3] && hl == [0.0; 3] {
+        return b;
+    }
     let keep_luma = ctx.params.b("preserveLuminosity");
     b.img.map_straight(|c| {
         let l = luminance(c[0], c[1], c[2]).clamp(0.0, 1.0);
@@ -1500,5 +1506,25 @@ mod tests {
         assert_eq!(p.eval(0.25, true), [0.5, 0.0, 0.5, 1.0]);
         assert_eq!(p.eval(0.75, true), [0.5, 0.0, 0.5, 1.0], "wraps around");
         assert_eq!(p.eval(0.25, false), [1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn neutral_vibrance_and_color_balance_return_input() {
+        // Two rows of 8: an opaque in-gamut ramp with an over-range pixel, then half alpha with an alpha-0 pixel.
+        let mut data: Vec<[f32; 4]> = (0..7).map(|x| [x as f32 / 6.0, 0.5, 1.0 - x as f32 / 6.0, 1.0]).collect();
+        data.push([1.5, 0.2, 0.2, 1.0]);
+        data.extend([[0.4, 0.1, 0.2, 0.5]; 7]);
+        data.push([0.0; 4]);
+        let img = Image { width: 8, height: 2, data };
+        let run = |id: &str, vals: &[(&str, Value)]| run_fx(id, vals, img.clone(), 0.0, EffectEnv::default()).img;
+        assert_eq!(run("ec.color.vibrance", &[]), img);
+        assert_eq!(run("ec.color.colorbalance", &[]), img);
+        assert_eq!(run("ec.color.colorbalance", &[("preserveLuminosity", Value::Bool(true))]), img);
+    }
+
+    #[test]
+    fn vibrance_saturation_still_maps_colour() {
+        assert!(!close(px("ec.color.vibrance", &[("vibrance", num(100.0))], [0.6, 0.5, 0.5, 1.0]), [0.6, 0.5, 0.5, 1.0], 1e-3));
+        assert!(close(px("ec.color.vibrance", &[("saturation", num(-100.0))], [0.8, 0.2, 0.2, 1.0]), [0.5, 0.5, 0.5, 1.0], 1e-5));
     }
 }

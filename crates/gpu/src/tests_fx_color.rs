@@ -15,8 +15,10 @@ fn on() -> Value {
 
 #[test]
 fn color_balance_vibrance_tritone_mixer() {
+    effect_case("ec.color.colorbalance", &[]);
     effect_case("ec.color.colorbalance", &[("shadowRed", n(40.0)), ("midGreen", n(-30.0)), ("hiBlue", n(60.0))]);
     effect_case("ec.color.colorbalance", &[("shadowBlue", n(-50.0)), ("midRed", n(70.0)), ("hiGreen", n(25.0)), ("preserveLuminosity", on())]);
+    effect_case("ec.color.vibrance", &[]);
     effect_case("ec.color.vibrance", &[("vibrance", n(60.0)), ("saturation", n(-20.0))]);
     effect_case("ec.color.vibrance", &[("vibrance", n(-40.0)), ("saturation", n(35.0))]);
     effect_case("ec.color.tritone", &[("midtones", c(0.6, 0.3, 0.5)), ("shadows", c(0.0, 0.1, 0.3)), ("blend", n(30.0))]);

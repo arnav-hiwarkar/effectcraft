@@ -78,12 +78,18 @@ fn point(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     match id {
         "ec.color.colorbalance" => {
             let g = |k: &str| f(k) / 100.0;
+            if ["shadowRed", "shadowGreen", "shadowBlue", "midRed", "midGreen", "midBlue", "hiRed", "hiGreen", "hiBlue"].into_iter().all(|k| g(k) == 0.0) {
+                return Some(b);
+            }
             p.u[0] = [1, pr.b("preserveLuminosity") as u32, 0, 0];
             p.f[0] = [g("shadowRed"), g("shadowGreen"), g("shadowBlue"), 0.0];
             p.f[1] = [g("midRed"), g("midGreen"), g("midBlue"), 0.0];
             p.f[2] = [g("hiRed"), g("hiGreen"), g("hiBlue"), 0.0];
         }
         "ec.color.vibrance" => {
+            if f("vibrance") == 0.0 && f("saturation") == 0.0 {
+                return Some(b);
+            }
             p.u[0][0] = 2;
             p.f[0] = [f("vibrance") / 100.0, f("saturation") / 100.0, 0.0, 0.0];
         }
