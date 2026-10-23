@@ -523,4 +523,37 @@ mod tests {
         assert_eq!(thumb_target(0, 1080), (1, 120));
         assert_eq!(thumb_target(1, 1), (1, 1));
     }
+
+    #[test]
+    fn thumb_pixels_samples_the_step_grid_and_refuses_an_empty_image() {
+        // Each pixel carries its own position: red is the column, green the row.
+        let picture = |w: u32, h: u32| {
+            let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
+            for y in 0..h {
+                for x in 0..w {
+                    rgba.extend_from_slice(&[x as u8, y as u8, 0, 255]);
+                }
+            }
+            effectcraft_render::Image::from_rgba8(w, h, &rgba)
+        };
+        // 256 × 2 steps by 2 along the long side: a 128 × 1 thumbnail of every second column.
+        let ([w, h], px) = thumb_pixels(&picture(256, 2)).expect("a picture");
+        assert_eq!([w, h], [128, 1]);
+        for (k, p) in px.chunks_exact(4).enumerate() {
+            assert_eq!(p, &[(2 * k) as u8, 0, 0, 255][..], "column {k}");
+        }
+        // A tall picture steps its rows the same way.
+        let ([w, h], px) = thumb_pixels(&picture(2, 256)).expect("a picture");
+        assert_eq!([w, h], [1, 128]);
+        for (k, p) in px.chunks_exact(4).enumerate() {
+            assert_eq!(p, &[0, (2 * k) as u8, 0, 255][..], "row {k}");
+        }
+        // A picture that already fits is copied as it is.
+        let ([w, h], px) = thumb_pixels(&picture(3, 2)).expect("a picture");
+        assert_eq!([w, h], [3, 2]);
+        assert_eq!(px.len(), 3 * 2 * 4);
+        assert_eq!(&px[20..24], &[2, 1, 0, 255][..]);
+        // Nothing to sample from.
+        assert!(thumb_pixels(&effectcraft_render::Image::from_rgba8(0, 0, &[])).is_none());
+    }
 }
