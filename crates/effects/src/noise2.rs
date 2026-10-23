@@ -183,16 +183,19 @@ fn match_grain(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let source = layer_or_self(ctx, &b, "noiseSourceLayer", false, false);
     let src_boxes = sampling_boxes(ctx, &source, b.scale);
     let box_col = ctx.params.get("sampling/sampleBoxColor").map(|v| v.as_color()).unwrap_or([1.0, 1.0, 0.0, 1.0]);
-    if view == 1 || view == 2 {
-        // Noise Samples (on the source) / Compensation Samples (on this layer).
-        let (mut img, boxes) = if view == 1 { (source, src_boxes) } else { (b.img.clone(), sampling_boxes(ctx, &b.img, b.scale)) };
-        draw_boxes(&mut img, &boxes, box_col);
+    if view == 1 {
+        let mut img = source;
+        draw_boxes(&mut img, &src_boxes, box_col);
         b.img = img;
+        return b;
+    }
+    if view == 2 {
+        let own_boxes = sampling_boxes(ctx, &b.img, b.scale);
+        draw_boxes(&mut b.img, &own_boxes, box_col);
         return b;
     }
     let src_stats = grain_stats_boxes(&source, &src_boxes);
     let comp = (ctx.params.f("compensateForExistingNoise") / 100.0) as f32;
-    // The own-layer boxes only matter for the compensation term; skip them when it is off.
     let own = if comp > 0.0 {
         let own_boxes = sampling_boxes(ctx, &b.img, b.scale);
         grain_stats_boxes(&b.img, &own_boxes)
@@ -462,6 +465,45 @@ mod tests {
         assert!(got > target * 0.4 && got < target * 2.5, "target {target} got {got}");
         let again = run_fx("ec.noise.matchgrain", &[("noiseSourceLayer", Value::Layer(Some(7)))], flat, 0.5, env);
         assert_eq!(out.img.data, again.img.data);
+    }
+
+    #[test]
+    fn match_grain_viewing_modes_output_fidelity() {
+        let base = Image::filled(64, 64, [0.5, 0.5, 0.5, 1.0]);
+        let src_img = noisy(64, 64, 0.1, 3);
+        let host = FakeHost(src_img);
+        let env = EffectEnv { host: Some(&host), ..Default::default() };
+        let mg = [("noiseSourceLayer", Value::Layer(Some(7)))];
+        let with = |extra: &[(&str, Value)]| run_fx("ec.noise.matchgrain", &[mg.as_slice(), extra].concat(), base.clone(), 0.0, env).img;
+
+        let final_out = with(&[("viewingMode", Value::Enum(4))]);
+        assert_ne!(final_out, base);
+        assert_ne!(final_out.get(2, 2), base.get(2, 2));
+        assert_ne!(final_out.get(32, 32), base.get(32, 32));
+        assert!(final_out.data.iter().any(|p| (p[0] - 0.5).abs() > 0.01));
+
+        let comp_samples = with(&[("viewingMode", Value::Enum(2))]);
+        assert_ne!(comp_samples, base);
+        assert!(comp_samples.data.iter().any(|p| *p == [1.0, 1.0, 0.0, 1.0]));
+
+        let noise_samples = with(&[("viewingMode", Value::Enum(1))]);
+        assert_ne!(noise_samples, base);
+        assert!(noise_samples.data.iter().any(|p| *p == [1.0, 1.0, 0.0, 1.0]));
+
+        let matte = with(&[("viewingMode", Value::Enum(3))]);
+        assert_ne!(matte, base);
+        assert!(matte.data.iter().all(|p| (p[0] - 1.0).abs() < 1e-6));
+
+        let prev = with(&[
+            ("viewingMode", Value::Enum(0)),
+            ("previewRegion/center", Value::Vec2([32.0, 32.0])),
+            ("previewRegion/width", num(20.0)),
+            ("previewRegion/height", num(20.0)),
+            ("previewRegion/showBox", Value::Bool(false)),
+        ]);
+        assert_eq!(prev.get(2, 2), base.get(2, 2));
+        assert_eq!(prev.get(32, 32), final_out.get(32, 32));
+        assert_ne!(prev.get(32, 32), base.get(32, 32));
     }
 
     #[test]
