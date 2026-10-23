@@ -405,4 +405,36 @@ mod tests {
         q.submit(Job { run: Box::new(move || tx.send(()).unwrap()), abandon: Box::new(|| panic!("no abandon")) });
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).ok(), Some(()));
     }
+
+    #[test]
+    fn build_queue_spawn_failure_abandons_builds_waiting_behind_it() {
+        let q = Arc::new(BuildQueue::new(1));
+        let gate = Arc::new(Gate(Mutex::new(0), Condvar::new()));
+        let abandoned = Arc::new(AtomicUsize::new(0));
+        // One build holds the only slot until the gate opens; two more wait behind it.
+        let holder = Arc::clone(&gate);
+        q.submit(Job { run: Box::new(move || holder.wait_for_turn(1)), abandon: Box::new(|| panic!("no abandon")) });
+        for _ in 0..2 {
+            let abandoned = Arc::clone(&abandoned);
+            q.submit(Job {
+                run: Box::new(|| panic!("never runs")),
+                abandon: Box::new(move || {
+                    abandoned.fetch_add(1, Ordering::SeqCst);
+                }),
+            });
+        }
+        assert_eq!(q.state.lock().unwrap().pending.len(), 2);
+        // The running build ends and the next one fails to spawn. Nothing is left running, so both
+        // waiting builds are abandoned together and none stays pending.
+        q.fail_spawn.store(true, Ordering::SeqCst);
+        gate.allow_turn(1);
+        wait_until(|| abandoned.load(Ordering::SeqCst) == 2);
+        wait_until(|| q.state.lock().unwrap().running == 0);
+        assert!(q.state.lock().unwrap().pending.is_empty());
+        // With spawning working again, a later submit runs.
+        let (tx, rx) = mpsc::channel();
+        q.fail_spawn.store(false, Ordering::SeqCst);
+        q.submit(Job { run: Box::new(move || tx.send(()).unwrap()), abandon: Box::new(|| panic!("no abandon")) });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).ok(), Some(()));
+    }
 }
