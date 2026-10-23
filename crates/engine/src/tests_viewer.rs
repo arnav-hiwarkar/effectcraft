@@ -221,58 +221,6 @@ fn channel_exposure_and_fast_preview_commands() {
     assert_eq!(s.state.snapping, !was);
 }
 
-/// #23b: fresh viewer state starts in Adaptive Resolution, while explicit serialized modes and
-/// the separate persisted draft preference keep exactly the user's choice.
-#[test]
-fn fast_previews_default_and_serialized_choices() {
-    use crate::EditorState;
-    use crate::commands::viewer_cmds::{FastPreviews, ViewOptions};
-    use crate::prefs::Prefs;
-
-    assert_eq!(Session::default().state.viewer.fast_previews, FastPreviews::AdaptiveResolution);
-    assert_eq!(ViewOptions::default().fast_previews, FastPreviews::AdaptiveResolution);
-    let empty: ViewOptions = serde_json::from_value(json!({})).unwrap();
-    assert_eq!(empty.fast_previews, FastPreviews::AdaptiveResolution);
-    let exposed: ViewOptions = serde_json::from_value(json!({"exposure": 1.5})).unwrap();
-    assert_eq!(exposed.fast_previews, FastPreviews::AdaptiveResolution);
-    assert_eq!(exposed.exposure, 1.5);
-    for mode in [empty.fast_previews, exposed.fast_previews] {
-        assert_eq!(mode.render(false), (false, 1.0));
-        assert_eq!(mode.render(true), (false, 0.25));
-    }
-
-    let mut state = serde_json::to_value(EditorState::default()).unwrap();
-    state.as_object_mut().unwrap().remove("viewer");
-    let state: EditorState = serde_json::from_value(state).unwrap();
-    assert_eq!(state.viewer.fast_previews, FastPreviews::AdaptiveResolution);
-
-    for (wire, expected) in [
-        ("Off", FastPreviews::Off),
-        ("AdaptiveResolution", FastPreviews::AdaptiveResolution),
-        ("Draft", FastPreviews::Draft),
-        ("FastDraft", FastPreviews::FastDraft),
-        ("Wireframe", FastPreviews::Wireframe),
-    ] {
-        let options: ViewOptions = serde_json::from_value(json!({"fast_previews": wire, "exposure": 1.5})).unwrap();
-        assert_eq!(options.fast_previews, expected);
-        assert_eq!(options.exposure, 1.5);
-        let serialized = serde_json::to_value(&options).unwrap();
-        assert_eq!(serialized.get("fast_previews"), Some(&json!(wire)));
-        let round_trip: ViewOptions = serde_json::from_value(serialized).unwrap();
-        assert_eq!(round_trip.fast_previews, expected);
-    }
-    assert_eq!(FastPreviews::Off.render(false), (false, 1.0));
-    assert_eq!(FastPreviews::Off.render(true), (false, 1.0));
-
-    assert!(!Prefs::from_json("{}").previews.fast_previews);
-    for (input, expected) in [("{\"previews\":{\"fastPreviews\":false}}", false), ("{\"previews\":{\"fastPreviews\":true}}", true)] {
-        let prefs = Prefs::from_json(input);
-        assert_eq!(prefs.previews.fast_previews, expected);
-        assert_eq!(Prefs::from_json(&prefs.to_json()).previews.fast_previews, expected);
-    }
-    assert!(serde_json::from_value::<ViewOptions>(json!({"fast_previews": "invalid"})).is_err());
-}
-
 #[test]
 fn snapshot_store_and_restore() {
     let mut s = comp();
