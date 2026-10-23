@@ -232,7 +232,7 @@ impl State<'_> {
 /// Frames per parallel batch. Every `Cx::frames` caller passes at most one batch, so this also caps
 /// the CPU frames in flight after a GPU fallback.
 pub(crate) fn batch_size() -> u64 {
-    rayon::current_num_threads().clamp(2, 4) as u64
+    rayon::current_num_threads().clamp(2, 6) as u64
 }
 
 /// Crop/pad 8-bit RGBA to `w`×`h` (codec rounding).
@@ -403,10 +403,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn batch_size_is_capped_at_four() {
+    fn batch_size_is_capped_at_six() {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
         let size = pool.install(batch_size);
-        assert_eq!(size, 4);
+        assert_eq!(size, 6);
 
         let single_thread_pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
         let size_single = single_thread_pool.install(batch_size);
