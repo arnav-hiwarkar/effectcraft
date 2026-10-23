@@ -650,10 +650,9 @@ fn vr_plane_to_sphere(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let feather = (ctx.params.f("feather") / 100.0).clamp(0.0, 1.0);
     let flat = Proj { kind: 5, fov };
     let eq = Proj { kind: 0, fov: 360.0 };
-    let src = b.img.clone();
-    let mut out = convert(&src, flat, eq, src.width, src.height, Some(&m));
+    let mut out = convert(&b.img, flat, eq, b.img.width, b.img.height, Some(&m));
     if feather > 0.0 {
-        let (w, h) = (src.width as f64, src.height as f64);
+        let (w, h) = (b.img.width as f64, b.img.height as f64);
         let t = (fov / 2.0).to_radians().tan();
         out.rows_mut().for_each(|(y, row)| {
             for (x, px) in row.iter_mut().enumerate() {
@@ -1320,6 +1319,30 @@ mod tests {
         let pic = Image::filled(64, 32, [1.0, 0.0, 0.0, 1.0]);
         let s = run_fx("ec.vr.planetosphere", &[], pic, 0.0, EffectEnv::default());
         assert!(s.img.get(32, 16)[3] > 0.99 && s.img.get(1, 16)[3] < 0.01);
+    }
+
+    #[test]
+    fn vr_plane_to_sphere_preserves_projection_and_feathering() {
+        let pic = Image::filled(64, 32, [1.0, 0.0, 0.0, 1.0]);
+        // Without feather the output is exactly the projection of the picture, for any transform.
+        for (scale, pan, tilt) in [(90.0, 0.0, 0.0), (60.0, 45.0, 15.0), (150.0, -30.0, 5.0)] {
+            let s = run_fx("ec.vr.planetosphere", &[("scale", num(scale)), ("pan", num(pan)), ("tilt", num(tilt))], pic.clone(), 0.0, EffectEnv::default());
+            let flat = Proj { kind: 5, fov: scale };
+            let eq = Proj { kind: 0, fov: 360.0 };
+            let expected = convert(&pic, flat, eq, 64, 32, Some(&rotation(tilt, pan, 0.0)));
+            assert_eq!(s.img.data, expected.data, "scale {scale} pan {pan} tilt {tilt}");
+        }
+        // Feather fades the picture's edges and leaves its centre alone.
+        let plain = run_fx("ec.vr.planetosphere", &[], pic.clone(), 0.0, EffectEnv::default()).img;
+        let feathered = run_fx("ec.vr.planetosphere", &[("feather", num(50.0))], pic.clone(), 0.0, EffectEnv::default()).img;
+        assert!(feathered.data.iter().zip(&plain.data).all(|(f, p)| (0..4).all(|c| f[c] <= p[c])));
+        assert_eq!(feathered.get(32, 16), plain.get(32, 16));
+        assert!(feathered.get(39, 16)[3] < 0.5 * plain.get(39, 16)[3], "{:?}", feathered.get(39, 16));
+        // Empty and single-pixel frames render without panicking.
+        let empty = run_fx("ec.vr.planetosphere", &[("feather", num(50.0))], Image::new(0, 0), 0.0, EffectEnv::default()).img;
+        assert!(empty.is_empty());
+        let dot = run_fx("ec.vr.planetosphere", &[("feather", num(50.0))], Image::filled(1, 1, [1.0, 0.0, 0.0, 1.0]), 0.0, EffectEnv::default()).img;
+        assert_eq!((dot.width, dot.height), (1, 1));
     }
 
     #[test]
