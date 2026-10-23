@@ -229,7 +229,8 @@ impl State<'_> {
     }
 }
 
-/// Frames per parallel batch.
+/// Frames per parallel batch. Every `Cx::frames` caller passes at most one batch, so this also caps
+/// the CPU frames in flight after a GPU fallback.
 pub(crate) fn batch_size() -> u64 {
     rayon::current_num_threads().clamp(2, 4) as u64
 }
