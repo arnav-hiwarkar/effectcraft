@@ -939,14 +939,16 @@ mod tests {
     #[test]
     fn color_neutralizer_and_arbitrary_map_identity_bypass() {
         let img = ramp();
-        assert_eq!(run("ec.color.cccolorneutralizer", &[], img.clone()).data, img.data);
-        assert_eq!(run("ec.color.psarbitrarymap", &[], img.clone()).data, img.data);
+        // Out-of-range values: the default-settings loops clamp these.
+        let hot = Image::filled(4, 4, [-0.2, 0.5, 1.5, 1.0]);
+        assert_eq!(run("ec.color.cccolorneutralizer", &[], hot.clone()).data, hot.data);
+        assert_eq!(run("ec.color.psarbitrarymap", &[], hot.clone()).data, hot.data);
         assert_ne!(run("ec.color.psarbitrarymap", &[("phase", num(10.0))], img.clone()).data, img.data);
         let cast = Image::filled(4, 4, [0.6, 0.5, 0.4, 1.0]);
         let unbalance = [("midtonesUnbalance", col(0.6, 0.5, 0.4)), ("midtonesBalance", col(0.5, 0.5, 0.5))];
         assert_ne!(run("ec.color.cccolorneutralizer", &unbalance, cast.clone()).data, cast.data);
         let full = [("blendWOriginal", num(100.0)), ("midtonesUnbalance", col(0.6, 0.5, 0.4)), ("midtonesBalance", col(0.5, 0.5, 0.5))];
-        assert_eq!(run("ec.color.cccolorneutralizer", &full, cast.clone()).data, cast.data);
+        assert_eq!(run("ec.color.cccolorneutralizer", &full, hot.clone()).data, hot.data);
     }
 
     #[test]
