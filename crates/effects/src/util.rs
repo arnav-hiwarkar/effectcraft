@@ -913,8 +913,7 @@ mod tests {
         use effectcraft_keyframe::{FeatherPoint, Gradient, ShapePath, TextDoc};
 
         let text = |t: &str| {
-            let mut d = TextDoc::default();
-            d.text = t.to_string();
+            let d = TextDoc { text: t.to_string(), ..Default::default() };
             Value::Text(Box::new(d))
         };
         let path = |dx: f64| {
