@@ -293,13 +293,17 @@ fn texturize(ctx: &EffectCtx, mut b: Buf) -> Buf {
 // ---- Brush Strokes ----
 
 fn brush_strokes(ctx: &EffectCtx, mut b: Buf) -> Buf {
+    let blend = ctx.params.f("blendWithOriginal") as f32 / 100.0;
+    let density = ctx.params.f("strokeDensity") as f32;
+    let surface = ctx.params.e("paintSurface");
+    if blend >= 1.0 || (density <= 0.0 && surface == 0) {
+        return b;
+    }
+
     let ang = ctx.params.f("strokeAngle");
     let size = (ctx.params.f("brushSize") * b.scale).max(0.5);
     let len = ctx.params.f("strokeLength") * b.scale;
-    let density = ctx.params.f("strokeDensity") as f32;
     let rnd = ctx.params.f("strokeRandomness");
-    let surface = ctx.params.e("paintSurface");
-    let blend = ctx.params.f("blendWithOriginal") as f32 / 100.0;
     let seed = ctx.seed ^ 0xb705;
     let cell = (size * 2.0).max(1.0);
     let src = b.img.clone();
@@ -1055,5 +1059,21 @@ mod tests {
         let (base, sharp, soft) = (fill(0.0), fill(100.0), fill(-100.0));
         assert!(steep(&sharp) > steep(&base) + 0.02, "{} vs {}", steep(&sharp), steep(&base));
         assert!(steep(&soft) < steep(&base) + 1e-4, "{} vs {}", steep(&soft), steep(&base));
+    }
+
+    #[test]
+    fn brush_strokes_identity_neutral() {
+        let img = ramp(16, 16);
+        let out_blend = run_at("ec.stylize.brushstrokes", &[("blendWithOriginal", num(100.0))], img.clone(), 0.0);
+        assert_eq!(out_blend.img, img);
+
+        let out_density = run_at("ec.stylize.brushstrokes", &[("strokeDensity", num(0.0)), ("paintSurface", Value::Enum(0))], img.clone(), 0.0);
+        assert_eq!(out_density.img, img);
+
+        let out_white = run_at("ec.stylize.brushstrokes", &[("strokeDensity", num(0.0)), ("paintSurface", Value::Enum(2))], img.clone(), 0.0);
+        assert_ne!(out_white.img, img);
+
+        let out_active = run_at("ec.stylize.brushstrokes", &[("blendWithOriginal", num(0.0)), ("strokeDensity", num(1.0))], img.clone(), 0.0);
+        assert_ne!(out_active.img, img);
     }
 }
