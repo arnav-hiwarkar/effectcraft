@@ -86,35 +86,51 @@ fn block_dissolve(ctx: &EffectCtx, mut b: Buf) -> Buf {
     b
 }
 
+#[inline]
+fn wipe_gradient_px(px: &mut Px, g: Px, done: f32, soft: f32, invert: bool) {
+    let (c, _) = unpremul(g);
+    let mut t = luminance(c[0], c[1], c[2]).clamp(0.0, 1.0);
+    if invert {
+        t = 1.0 - t;
+    }
+    let k = if done >= 1.0 {
+        0.0
+    } else if soft > 0.0 {
+        ((t - (done * (1.0 + soft) - soft)) / soft).clamp(0.0, 1.0)
+    } else if t >= done {
+        1.0
+    } else {
+        0.0
+    };
+    scale_px(px, k);
+}
+
 fn gradient_wipe(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let done = completion(ctx) as f32;
     if done <= 0.0 {
         return b;
     }
+    if done >= 1.0 {
+        b.img.data.fill([0.0; 4]);
+        return b;
+    }
     let soft = (ctx.params.f("softness") / 100.0) as f32;
     let invert = ctx.params.b("invert");
     // The gradient layer (the layer itself when none is chosen), placed over this one.
-    let grad = match ctx.layer_param("gradientLayer", false) {
-        Some(o) => place_layer(ctx, &b, &o, ctx.params.e("gradientPlacement")),
-        None => b.img.clone(),
-    };
-    b.img.data.par_iter_mut().zip(grad.data.par_iter()).for_each(|(px, g)| {
-        let (c, _) = unpremul(*g);
-        let mut t = luminance(c[0], c[1], c[2]).clamp(0.0, 1.0);
-        if invert {
-            t = 1.0 - t;
+    match ctx.layer_param("gradientLayer", false) {
+        Some(o) => {
+            let grad = place_layer(ctx, &b, &o, ctx.params.e("gradientPlacement"));
+            b.img.data.par_iter_mut().zip(grad.data.par_iter()).for_each(|(px, g)| {
+                wipe_gradient_px(px, *g, done, soft, invert);
+            });
         }
-        let k = if done >= 1.0 {
-            0.0
-        } else if soft > 0.0 {
-            ((t - (done * (1.0 + soft) - soft)) / soft).clamp(0.0, 1.0)
-        } else if t >= done {
-            1.0
-        } else {
-            0.0
-        };
-        scale_px(px, k);
-    });
+        None => {
+            b.img.data.par_iter_mut().for_each(|px| {
+                let g = *px;
+                wipe_gradient_px(px, g, done, soft, invert);
+            });
+        }
+    }
     b
 }
 
@@ -822,6 +838,58 @@ mod tests {
         assert_eq!(tl.get(11, 1)[3], 0.0);
         assert_eq!(tl.get(18, 1)[3], 1.0);
         assert_eq!(tl.get(31, 1)[3], 0.0);
+    }
+
+    #[test]
+    fn gradient_wipe_self_gradient_in_place_matches_reference() {
+        let reference = |src: &Image, comp: f64, soft: f64, invert: bool| -> Image {
+            let done = (comp / 100.0).clamp(0.0, 1.0) as f32;
+            if done <= 0.0 {
+                return src.clone();
+            }
+            if done >= 1.0 {
+                return Image::filled(src.width, src.height, [0.0; 4]);
+            }
+            let soft = (soft / 100.0) as f32;
+            let mut out = src.clone();
+            for px in &mut out.data {
+                let (c, _) = unpremul(*px);
+                let mut t = luminance(c[0], c[1], c[2]).clamp(0.0, 1.0);
+                if invert {
+                    t = 1.0 - t;
+                }
+                let k = if soft > 0.0 {
+                    ((t - (done * (1.0 + soft) - soft)) / soft).clamp(0.0, 1.0)
+                } else if t >= done {
+                    1.0
+                } else {
+                    0.0
+                };
+                scale_px(px, k);
+            }
+            out
+        };
+
+        let img = ramp(40, 10);
+        let completions = [0.0, 25.0, 50.0, 75.0, 100.0];
+        let softnesses = [0.0, 50.0];
+        let inverts = [false, true];
+
+        for &comp in &completions {
+            for &soft in &softnesses {
+                for &inv in &inverts {
+                    let out = run("ec.transition.gradientwipe", &img, &[("completion", num(comp)), ("softness", num(soft)), ("invert", Value::Bool(inv))]);
+                    let expected = reference(&img, comp, soft, inv);
+                    assert_eq!(out, expected, "mismatch at comp={comp}, soft={soft}, invert={inv}");
+                    if comp == 0.0 {
+                        assert_eq!(out, img);
+                    }
+                    if comp == 100.0 {
+                        assert!(out.data.iter().all(|px| *px == [0.0; 4]));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
