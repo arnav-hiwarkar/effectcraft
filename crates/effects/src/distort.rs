@@ -27,8 +27,12 @@ fn remap(src: &Image, repeat: bool, f: impl Fn(f64, f64) -> (f64, f64) + Sync) -
 
 fn twirl(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let ang = ctx.params.f("angle").to_radians();
+    let radius = ctx.params.f("radius");
+    if ang.abs() < 1e-9 || radius <= 0.0 || !ang.is_finite() || !radius.is_finite() {
+        return b;
+    }
     // Twirl Radius is a percentage of the layer's larger dimension: 50 reaches the edges.
-    let r = (ctx.params.f("radius") / 100.0 * b.layer_w(ctx).max(b.layer_h(ctx)) * b.scale).max(1.0);
+    let r = (radius / 100.0 * b.layer_w(ctx).max(b.layer_h(ctx)) * b.scale).max(1.0);
     let c = b.to_px(ctx.params.v2("center"));
     b.img = remap(&b.img, false, |x, y| {
         let (dx, dy) = (x - c.0, y - c.1);
@@ -45,7 +49,11 @@ fn twirl(ctx: &EffectCtx, mut b: Buf) -> Buf {
 }
 
 fn spherize(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let r = (ctx.params.f("radius") * b.scale).max(1.0);
+    let radius = ctx.params.f("radius");
+    if radius <= 0.0 || !radius.is_finite() {
+        return b;
+    }
+    let r = (radius * b.scale).max(1.0);
     let c = b.to_px(ctx.params.v2("center"));
     b.img = remap(&b.img, false, |x, y| {
         let (dx, dy) = (x - c.0, y - c.1);
@@ -61,10 +69,15 @@ fn spherize(ctx: &EffectCtx, mut b: Buf) -> Buf {
 }
 
 fn bulge(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let rx = (ctx.params.f("hradius") * b.scale).max(1.0);
-    let ry = (ctx.params.f("vradius") * b.scale).max(1.0);
-    let c = b.to_px(ctx.params.v2("center"));
+    let hr = ctx.params.f("hradius");
+    let vr = ctx.params.f("vradius");
     let h = ctx.params.f("height");
+    if h.abs() < 1e-9 || hr <= 0.0 || vr <= 0.0 || !h.is_finite() || !hr.is_finite() || !vr.is_finite() {
+        return b;
+    }
+    let rx = (hr * b.scale).max(1.0);
+    let ry = (vr * b.scale).max(1.0);
+    let c = b.to_px(ctx.params.v2("center"));
     // Taper Radius: higher values make the sides of the bulge shallower (a more peaked profile).
     let taper = 1.0 + ctx.params.f("taperRadius").max(0.0) / 100.0 * 3.0;
     let pin = ctx.params.b("pinAllEdges");
@@ -510,6 +523,77 @@ mod tests {
         let o = run("ec.distort.twirl", &[("angle", num(90.0)), ("radius", num(50.0))], im.clone());
         assert!(differs(o.img.get(50, 10), im.get(50, 10)));
         assert_eq!(o.img.get(0, 0), im.get(0, 0));
+    }
+
+    #[test]
+    fn twirl_neutral_params_bypass_remap() {
+        let im = img(40, 40);
+        for set in [vec![], vec![("angle", num(0.0))], vec![("angle", num(1e-10))], vec![("angle", num(90.0)), ("radius", num(0.0))]] {
+            let input = img(40, 40);
+            let expected = input.clone();
+            let data_ptr = input.data.as_ptr();
+            let output = run("ec.distort.twirl", &set, input);
+            assert_eq!(output.img, expected);
+            assert_eq!(output.img.data.as_ptr(), data_ptr);
+        }
+        let active = run("ec.distort.twirl", &[("angle", num(90.0)), ("radius", num(50.0))], im.clone());
+        assert!(active.img.data.iter().zip(&im.data).any(|(a, b)| differs(*a, *b)));
+    }
+
+    #[test]
+    fn spherize_neutral_params_bypass_remap() {
+        let im = img(40, 40);
+        for set in [vec![], vec![("radius", num(-1.0))]] {
+            let input = img(40, 40);
+            let expected = input.clone();
+            let data_ptr = input.data.as_ptr();
+            let output = run("ec.distort.spherize", &set, input);
+            assert_eq!(output.img, expected);
+            assert_eq!(output.img.data.as_ptr(), data_ptr);
+        }
+        let active = run("ec.distort.spherize", &[("radius", num(50.0))], im.clone());
+        assert!(active.img.data.iter().zip(&im.data).any(|(a, b)| differs(*a, *b)));
+    }
+
+    #[test]
+    fn bulge_neutral_params_bypass_remap() {
+        let im = img(40, 40);
+        for set in [vec![("height", num(0.0))], vec![("height", num(-1e-10))], vec![("hradius", num(0.0))], vec![("vradius", num(0.0))]] {
+            let input = img(40, 40);
+            let expected = input.clone();
+            let data_ptr = input.data.as_ptr();
+            let output = run("ec.distort.bulge", &set, input);
+            assert_eq!(output.img, expected);
+            assert_eq!(output.img.data.as_ptr(), data_ptr);
+        }
+        let active = run("ec.distort.bulge", &[("height", num(2.0))], im.clone());
+        assert!(active.img.data.iter().zip(&im.data).any(|(a, b)| differs(*a, *b)));
+    }
+
+    #[test]
+    fn distort_non_finite_params_do_not_crash() {
+        let cases = [
+            ("ec.distort.twirl", vec![("angle", num(f64::NAN))]),
+            ("ec.distort.twirl", vec![("angle", num(f64::INFINITY))]),
+            ("ec.distort.twirl", vec![("angle", num(90.0)), ("radius", num(f64::NAN))]),
+            ("ec.distort.twirl", vec![("angle", num(90.0)), ("radius", num(f64::INFINITY))]),
+            ("ec.distort.spherize", vec![("radius", num(f64::NAN))]),
+            ("ec.distort.spherize", vec![("radius", num(f64::INFINITY))]),
+            ("ec.distort.bulge", vec![("height", num(f64::NAN))]),
+            ("ec.distort.bulge", vec![("height", num(f64::INFINITY))]),
+            ("ec.distort.bulge", vec![("hradius", num(f64::NAN))]),
+            ("ec.distort.bulge", vec![("hradius", num(f64::INFINITY))]),
+            ("ec.distort.bulge", vec![("vradius", num(f64::NAN))]),
+            ("ec.distort.bulge", vec![("vradius", num(f64::INFINITY))]),
+        ];
+        for (id, set) in cases {
+            let input = img(40, 40);
+            let expected = input.clone();
+            let data_ptr = input.data.as_ptr();
+            let output = run(id, &set, input);
+            assert_eq!(output.img, expected, "{id} with {set:?}");
+            assert_eq!(output.img.data.as_ptr(), data_ptr, "{id} with {set:?}");
+        }
     }
 
     #[test]
