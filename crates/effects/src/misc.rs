@@ -426,10 +426,13 @@ fn blend_with(orig: [f32; 4], fx: [f32; 4], k: f32) -> [f32; 4] {
 }
 
 fn emboss(ctx: &EffectCtx, mut b: Buf) -> Buf {
+    let blend = ctx.params.f("blend") as f32 / 100.0;
+    if blend >= 1.0 {
+        return b;
+    }
     let ang = ctx.params.f("direction").to_radians();
     let relief = ctx.params.f("relief") * b.scale;
     let contrast = ctx.params.f("contrast") as f32 / 100.0;
-    let blend = ctx.params.f("blend") as f32 / 100.0;
     let (dx, dy) = (ang.cos() * relief, -ang.sin() * relief);
     let src = b.img.clone();
     b.img.rows_mut().for_each(|(y, row)| {
@@ -779,5 +782,23 @@ mod tests {
         let red = run(&[("colors", Value::Enum(2)), ("arbitraryMap", Value::Str("0,1 1,1|0,0 1,0|0,0 1,0".into())), ("operation", Value::Enum(2))]);
         let p = red.get(6, 12);
         assert!(p[0] > 0.05 && p[1] < 1e-4 && p[2] < 1e-4, "{p:?}");
+    }
+
+    #[test]
+    fn emboss_neutral_blend_skips_processing() {
+        let img = scene();
+        let out = run_fx("ec.stylize.emboss", &[("blend", num(100.0))], img.clone(), 0.0, EffectEnv::default());
+        assert_eq!(out.img, img);
+
+        for params in [&[("contrast", num(0.0)), ("blend", num(0.0))][..], &[("relief", num(0.0)), ("blend", num(0.0))][..]] {
+            let res = run_fx("ec.stylize.emboss", params, img.clone(), 0.0, EffectEnv::default());
+            assert_ne!(res.img, img);
+            for px in &res.img.data {
+                assert!((px[0] - 0.5).abs() < 1e-4);
+                assert!((px[1] - 0.5).abs() < 1e-4);
+                assert!((px[2] - 0.5).abs() < 1e-4);
+                assert!((px[3] - 1.0).abs() < 1e-4);
+            }
+        }
     }
 }
