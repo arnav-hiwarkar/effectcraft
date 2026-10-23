@@ -321,12 +321,16 @@ fn camera_lens_blur(ctx: &EffectCtx, mut b: Buf) -> Buf {
         let (c, a) = unpremul(*px);
         *px = premul(c.map(effectcraft_color::srgb_to_linear), a);
     };
+    let to_srgb = |px: [f32; 4]| -> [f32; 4] {
+        let (c, a) = unpremul(px);
+        premul(c.map(|v| effectcraft_color::linear_to_srgb(v.max(0.0))), a)
+    };
     // Highlights: boost bright pixels before the blur so they bloom into bokeh shapes; Saturation
     // keeps their colour (100) or pushes the added energy towards white (0).
     let thr = ctx.params.f("highlight/specularThreshold") as f32 / 255.0;
     let boost = 1.0 + ctx.params.f("highlight/specularBrightness").max(0.0) as f32 / 100.0 * 4.0;
     let sat = (ctx.params.f("highlight/highlightSaturation") / 100.0).clamp(0.0, 1.0) as f32;
-    let mut src = b.img.clone();
+    let mut src = Image { width: b.img.width, height: b.img.height, data: std::mem::take(&mut b.img.data) };
     if linear {
         src.data.par_iter_mut().for_each(to_lin);
     }
@@ -440,8 +444,7 @@ fn camera_lens_blur(ctx: &EffectCtx, mut b: Buf) -> Buf {
         let mut px = acc.map(|v| v as f32);
         px[3] = px[3].clamp(0.0, 1.0);
         if linear {
-            let (c, a) = unpremul(px);
-            px = premul(c.map(|v| effectcraft_color::linear_to_srgb(v.max(0.0))), a);
+            px = to_srgb(px);
         }
         px
     };
@@ -484,13 +487,21 @@ fn camera_lens_blur(ctx: &EffectCtx, mut b: Buf) -> Buf {
             // Radii quantised to levels; each pixel blends the two nearest.
             let levels = (r.ceil() as usize).clamp(1, 8);
             let irises: Vec<_> = (0..=levels).map(|k| iris(r * k as f64 / levels as f64)).collect();
-            let srcd = &b.img.data;
+            let srcd = &src.data;
             out.rows_mut().for_each(|(y, row)| {
                 for (x, o) in row.iter_mut().enumerate() {
-                    let f = m[y * w + x] * levels as f32;
+                    let idx = y.checked_mul(w).and_then(|i| i.checked_add(x)).unwrap_or(usize::MAX);
+                    let f = m.get(idx).copied().unwrap_or(0.0) * levels as f32;
                     let k0 = (f.floor() as usize).min(levels);
                     let t = f - k0 as f32;
-                    let at = |k: usize| if k == 0 || r * k as f64 / (levels as f64) < 0.5 { srcd[y * w + x] } else { blur_px(&irises[k], x, y) };
+                    let at = |k: usize| {
+                        if k == 0 || r * k as f64 / (levels as f64) < 0.5 {
+                            let px = srcd.get(idx).copied().unwrap_or([0.0; 4]);
+                            if linear { to_srgb(px) } else { px }
+                        } else {
+                            blur_px(&irises[k], x, y)
+                        }
+                    };
                     let a = at(k0);
                     *o = if t > 1e-4 && k0 < levels {
                         let bq = at(k0 + 1);
@@ -963,5 +974,50 @@ mod tests {
         let out = crate::run_fx("ec.blur.cameralens", &vals, stripes.clone(), 0.0, EffectEnv { host: Some(&Half), ..Default::default() }).img;
         assert_eq!(out.get(4, 10), stripes.get(4, 10), "sharp where the map is at the focal distance");
         assert!((out.get(30, 10)[0] - 0.5).abs() < 0.2, "{:?}", out.get(30, 10));
+    }
+
+    #[test]
+    fn camera_lens_blur_in_place_avoids_clone_and_preserves_blur_map() {
+        use crate::{EffectEnv, EffectHost, LayerPixels};
+
+        struct BlurMapHost;
+        impl EffectHost for BlurMapHost {
+            fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
+                let mut m = Image::filled(40, 20, [0.0, 0.0, 0.0, 1.0]);
+                for y in 0..20 {
+                    for x in 20..40 {
+                        m.set(x, y, [1.0, 1.0, 1.0, 1.0]);
+                    }
+                }
+                Some(LayerPixels { buf: Buf { img: m, offset: [0.0; 2], scale: 1.0 }, size: [40.0, 20.0] })
+            }
+            fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+                None
+            }
+        }
+
+        let stripes = crate::util::gen_image(40, 20, |x, _| if x % 4 < 2 { [1.0, 1.0, 1.0, 1.0] } else { [0.0, 0.0, 0.0, 1.0] });
+
+        for linear in [false, true] {
+            let vals = [
+                ("blurRadius", num(6.0)),
+                ("repeatEdge", Value::Bool(true)),
+                ("useLinear", Value::Bool(linear)),
+                ("blurMap/blurMapLayer", Value::Layer(Some(1))),
+            ];
+            let out = crate::run_fx("ec.blur.cameralens", &vals, stripes.clone(), 0.0, EffectEnv { host: Some(&BlurMapHost), ..Default::default() }).img;
+
+            let orig = stripes.get(4, 10);
+            let rendered = out.get(4, 10);
+            for c in 0..4 {
+                assert!(
+                    (rendered[c] - orig[c]).abs() < 1e-4,
+                    "linear={linear}, unblurred pixel at focal distance should match source: {rendered:?} vs {orig:?}"
+                );
+            }
+
+            let blurred = out.get(30, 10);
+            assert!((blurred[0] - 0.5).abs() < 0.2, "linear={linear}, blurred region should be blurred: {blurred:?}");
+        }
     }
 }
