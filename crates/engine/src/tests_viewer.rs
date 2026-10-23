@@ -221,30 +221,35 @@ fn channel_exposure_and_fast_preview_commands() {
     assert_eq!(s.state.snapping, !was);
 }
 
-/// #23b: fresh viewer state starts in Adaptive Resolution, while explicit serialized modes and
-/// the separate persisted draft preference keep exactly the user's choice.
+/// #23b: fresh viewers use `FastPreviews::default()`. Adaptive Resolution stays selectable and
+/// serializes, and explicit saved modes and the separate draft preference keep the user's choice.
 #[test]
 fn fast_previews_default_and_serialized_choices() {
     use crate::EditorState;
     use crate::commands::viewer_cmds::{FastPreviews, ViewOptions};
     use crate::prefs::Prefs;
 
-    assert_eq!(Session::default().state.viewer.fast_previews, FastPreviews::AdaptiveResolution);
-    assert_eq!(ViewOptions::default().fast_previews, FastPreviews::AdaptiveResolution);
+    assert_eq!(Session::default().state.viewer.fast_previews, FastPreviews::default());
+    assert_eq!(ViewOptions::default().fast_previews, FastPreviews::default());
     let empty: ViewOptions = serde_json::from_value(json!({})).unwrap();
-    assert_eq!(empty.fast_previews, FastPreviews::AdaptiveResolution);
+    assert_eq!(empty.fast_previews, FastPreviews::default());
     let exposed: ViewOptions = serde_json::from_value(json!({"exposure": 1.5})).unwrap();
-    assert_eq!(exposed.fast_previews, FastPreviews::AdaptiveResolution);
+    assert_eq!(exposed.fast_previews, FastPreviews::default());
     assert_eq!(exposed.exposure, 1.5);
-    for mode in [empty.fast_previews, exposed.fast_previews] {
-        assert_eq!(mode.render(false), (false, 1.0));
-        assert_eq!(mode.render(true), (false, 0.25));
-    }
+
+    let mut s = comp();
+    s.execute("view.fastPreviewMode", json!({"mode": "adaptive"})).unwrap();
+    assert_eq!(s.state.viewer.fast_previews, FastPreviews::AdaptiveResolution);
+    let serialized = serde_json::to_value(&s.state.viewer).unwrap();
+    let chosen: ViewOptions = serde_json::from_value(serialized).unwrap();
+    assert_eq!(chosen.fast_previews, FastPreviews::AdaptiveResolution);
+    assert_eq!(chosen.fast_previews.render(false), (false, 1.0));
+    assert_eq!(chosen.fast_previews.render(true), (false, 0.25));
 
     let mut state = serde_json::to_value(EditorState::default()).unwrap();
     state.as_object_mut().unwrap().remove("viewer");
     let state: EditorState = serde_json::from_value(state).unwrap();
-    assert_eq!(state.viewer.fast_previews, FastPreviews::AdaptiveResolution);
+    assert_eq!(state.viewer.fast_previews, FastPreviews::default());
 
     for (wire, expected) in [
         ("Off", FastPreviews::Off),
