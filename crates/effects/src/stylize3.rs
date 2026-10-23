@@ -295,27 +295,41 @@ fn glass(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let k = height * 25.0;
     let disp = ctx.params.f("displacement") * b.scale * 0.25;
     let light = BumpLight::from(ctx, &b);
-    let src = b.img.clone();
-    b.img.rows_mut().for_each(|(y, row)| {
-        for (x, px) in row.iter_mut().enumerate() {
-            let n = normal(&hf, x, y, k);
-            let (fx, fy) = (x as f64 + 0.5, y as f64 + 0.5);
-            let s = if disp != 0.0 && height != 0.0 {
-                src.sample_bilinear_clamped(fx + n[0] as f64 * disp, fy + n[1] as f64 * disp)
-            } else {
-                src.data[y * src.width as usize + x]
-            };
-            let a = src.data[y * src.width as usize + x][3];
-            if a <= 0.0 {
-                *px = [0.0; 4];
-                continue;
+    if disp == 0.0 || height == 0.0 {
+        b.img.rows_mut().for_each(|(y, row)| {
+            for (x, px) in row.iter_mut().enumerate() {
+                let a = px[3];
+                if a <= 0.0 {
+                    *px = [0.0; 4];
+                    continue;
+                }
+                let n = normal(&hf, x, y, k);
+                let (fx, fy) = (x as f64 + 0.5, y as f64 + 0.5);
+                let (c, _) = unpremul(*px);
+                let o = light.shade(c, n, light.to_light(fx, fy));
+                *px = premul(o, a);
             }
-            let (c, sa) = unpremul(s);
-            let c = if sa > 0.0 { c } else { unpremul(src.data[y * src.width as usize + x]).0 };
-            let o = light.shade(c, n, light.to_light(fx, fy));
-            *px = premul(o, a);
-        }
-    });
+        });
+    } else {
+        let src = b.img.clone();
+        b.img.rows_mut().for_each(|(y, row)| {
+            for (x, px) in row.iter_mut().enumerate() {
+                let orig = *px;
+                let a = orig[3];
+                if a <= 0.0 {
+                    *px = [0.0; 4];
+                    continue;
+                }
+                let n = normal(&hf, x, y, k);
+                let (fx, fy) = (x as f64 + 0.5, y as f64 + 0.5);
+                let s = src.sample_bilinear_clamped(fx + n[0] as f64 * disp, fy + n[1] as f64 * disp);
+                let (c, sa) = unpremul(s);
+                let c = if sa > 0.0 { c } else { unpremul(orig).0 };
+                let o = light.shade(c, n, light.to_light(fx, fy));
+                *px = premul(o, a);
+            }
+        });
+    }
     b
 }
 
@@ -619,6 +633,33 @@ mod tests {
         assert_eq!(run("ec.stylize.ccburnfilm", &[], img.clone()).img.data, img.data);
         let o = run("ec.stylize.ccburnfilm", &[("burn", num(100.0))], img);
         assert!(o.img.data.iter().all(|p| p[3] == 0.0));
+    }
+
+    #[test]
+    fn glass_zero_displacement_in_place_matches_displaced() {
+        let mut img = bumpy(40, 32);
+        img.set(0, 0, [0.5, 0.5, 0.3, 0.0]);
+        img.set(1, 0, [0.0, 0.0, 0.0, -0.1]);
+
+        let a = run("ec.stylize.ccglass", &[("displacement", num(0.0))], img.clone());
+        let b = run("ec.stylize.ccglass", &[("displacement", num(0.0))], img.clone());
+        assert_eq!(a.img.data, b.img.data);
+
+        // Transparent pixels are cleared.
+        assert_eq!(a.img.get(0, 0), [0.0; 4]);
+        assert_eq!(a.img.get(1, 0), [0.0; 4]);
+
+        // When height = 0.0 and specular = 0.0, in-place evaluation matches identity.
+        let flat = run("ec.stylize.ccglass", &[("height", num(0.0)), ("specular", num(0.0))], img.clone());
+        for y in 0..img.height {
+            for x in 0..img.width {
+                if (x, y) != (0, 0) && (x, y) != (1, 0) {
+                    let orig = img.get(x as i64, y as i64);
+                    let out = flat.img.get(x as i64, y as i64);
+                    assert!((0..4).all(|c| (orig[c] - out[c]).abs() < 1e-4));
+                }
+            }
+        }
     }
 
     #[test]
