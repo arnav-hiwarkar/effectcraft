@@ -470,10 +470,13 @@ fn motion_tile(ctx: &EffectCtx, b: Buf) -> Buf {
 // ---- Color Emboss ----
 
 fn color_emboss(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let ang = ctx.params.f("direction").to_radians();
     let relief = ctx.params.f("relief") * b.scale;
     let contrast = ctx.params.f("contrast") as f32 / 100.0;
     let blend = ctx.params.f("blend") as f32 / 100.0;
+    if blend >= 1.0 || contrast == 0.0 || relief == 0.0 {
+        return b;
+    }
+    let ang = ctx.params.f("direction").to_radians();
     let (dx, dy) = (ang.cos() * relief, -ang.sin() * relief);
     let src = b.img.clone();
     b.img.rows_mut().for_each(|(y, row)| {
@@ -1069,5 +1072,17 @@ mod tests {
 
         let out_active = run_at("ec.stylize.brushstrokes", &[("blendWithOriginal", num(0.0)), ("strokeDensity", num(1.0))], img.clone(), 0.0);
         assert_ne!(out_active.img, img);
+    }
+
+    #[test]
+    fn color_emboss_neutral_params_skip_processing() {
+        let img = ramp(16, 16);
+        let modified = run_at("ec.stylize.coloremboss", &[], img.clone(), 0.0);
+        assert_ne!(modified.img, img);
+
+        for params in [&[("blend", num(100.0))][..], &[("contrast", num(0.0))][..], &[("relief", num(0.0))][..]] {
+            let out = run_at("ec.stylize.coloremboss", params, img.clone(), 0.0);
+            assert_eq!(out.img, img);
+        }
     }
 }
