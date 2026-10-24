@@ -395,19 +395,26 @@ impl MediaPool {
         Some(folder.join(format!("{:016x}_{rate}.ecaf", h.finish())))
     }
 
-    /// Samples from a conformed file: `Some` when it exists and covers the request.
+    /// Samples from a structurally complete conformed file, with silence outside its duration.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    fn read_conformed(file: &std::path::Path, s0: usize, frames: usize) -> Option<Vec<f32>> {
+    fn read_conformed(file: &std::path::Path, expected: usize, s0: usize, frames: usize) -> Option<Vec<f32>> {
         use std::io::{Read, Seek, SeekFrom};
         let mut f = std::fs::File::open(file).ok()?;
-        let len = f.metadata().ok()?.len() as usize / 8;
-        let mut out = vec![0.0f32; frames * 2];
-        if s0 >= len {
+        let expected_bytes = u64::try_from(expected).ok()?.checked_mul(8)?;
+        let metadata = f.metadata().ok()?;
+        if !metadata.is_file() || metadata.len() != expected_bytes {
+            return None;
+        }
+        let samples = frames.checked_mul(2)?;
+        let n = frames.min(expected.saturating_sub(s0));
+        let offset = u64::try_from(s0).ok()?.checked_mul(8)?;
+        let byte_count = n.checked_mul(8)?;
+        let mut out = vec![0.0f32; samples];
+        if n == 0 {
             return Some(out);
         }
-        let n = frames.min(len - s0);
-        f.seek(SeekFrom::Start(s0 as u64 * 8)).ok()?;
-        let mut bytes = vec![0u8; n * 8];
+        f.seek(SeekFrom::Start(offset)).ok()?;
+        let mut bytes = vec![0u8; byte_count];
         f.read_exact(&mut bytes).ok()?;
         for (o, c) in out.iter_mut().zip(bytes.as_chunks::<4>().0.iter()) {
             *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
@@ -422,6 +429,11 @@ impl MediaPool {
         if lock(&self.inner.conform_failed).contains(&file) || !lock(&self.inner.conforming).insert(file.clone()) {
             return;
         }
+        if lock(&self.inner.conform_failed).contains(&file) || Self::read_conformed(&file, frames, 0, 0).is_some() {
+            lock(&self.inner.conforming).remove(&file);
+            return;
+        }
+        let failed_file = file.clone();
         let (pool, f) = (self.clone(), footage.clone());
         let spawned = std::thread::Builder::new().name("ec-conform-audio".into()).spawn(move || {
             let tmp = file.with_extension("tmp");
@@ -440,7 +452,8 @@ impl MediaPool {
             lock(&pool.inner.conforming).remove(&file);
         });
         if spawned.is_err() {
-            lock(&self.inner.conforming).clear();
+            lock(&self.inner.conform_failed).insert(failed_file.clone());
+            lock(&self.inner.conforming).remove(&failed_file);
         }
     }
 
@@ -474,20 +487,21 @@ impl MediaPool {
         if let Some(conform) = conform_frames(footage, rate)
             && let Some(file) = self.conformed_path(&footage.path, rate)
         {
-            let s0 = start.to_units_floor(rate as i64);
-            if file.exists() && !lock(&self.inner.conforming).contains(&file) {
-                let skip = (-s0).max(0) as usize;
-                if skip >= frames {
-                    return vec![0.0; frames * 2];
-                }
-                if let Some(v) = Self::read_conformed(&file, s0.max(0) as usize, frames - skip) {
-                    let mut out = vec![0.0; skip * 2];
-                    out.extend(v);
-                    return out;
-                }
-            } else {
-                self.conform(footage, file, conform, rate);
+            let s0 = start.to_units_floor(i64::from(rate));
+            let skip = usize::try_from(s0.saturating_neg().max(0)).unwrap_or(usize::MAX).min(frames);
+            let Some(samples) = frames.checked_mul(2) else { return Vec::new() };
+            if skip == frames {
+                return vec![0.0; samples];
             }
+            if !lock(&self.inner.conforming).contains(&file)
+                && let Ok(at) = usize::try_from(s0.max(0))
+                && let Some(v) = Self::read_conformed(&file, conform, at, frames - skip)
+            {
+                let mut out = vec![0.0; skip * 2];
+                out.extend(v);
+                return out;
+            }
+            self.conform(footage, file, conform, rate);
         }
         self.decode_audio(footage, start, frames, rate)
     }
@@ -943,6 +957,149 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn conform_fixture(name: &str) -> (std::path::PathBuf, Footage, MediaPool, std::path::PathBuf, Vec<u8>) {
+        let dir = std::env::temp_dir().join(format!("effectcraft-conform-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("source.wav");
+        let mut wav = b"RIFF\x44\0\0\0WAVEfmt \x10\0\0\0\x01\0\x02\0\x40\x1f\0\0\0\x7d\0\0\x04\0\x10\0data\x20\0\0\0".to_vec();
+        for _ in 0..8 {
+            wav.extend(8192i16.to_le_bytes());
+            wav.extend((-16384i16).to_le_bytes());
+        }
+        std::fs::write(&path, wav).unwrap();
+        let footage = crate::probe(&path).unwrap();
+        assert_eq!(conform_frames(&footage, 8000), Some(8));
+        let pool = MediaPool::new();
+        pool.set_conform_folder(Some(dir.join("cache")));
+        let file = pool.conformed_path(&footage.path, 8000).unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let bytes: Vec<_> = [0.25f32, -0.5].repeat(8).into_iter().flat_map(f32::to_le_bytes).collect();
+        assert_eq!(bytes.len(), 64);
+        (dir, footage, pool, file, bytes)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn settle_conform(pool: &MediaPool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !lock(&pool.inner.conforming).is_empty() {
+            assert!(std::time::Instant::now() < deadline, "conform worker timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn assert_conform_samples(case: &str, actual: &[f32], expected: &[f32]) {
+        let mismatches = actual.iter().zip(expected).filter(|(a, b)| a != b).count() + actual.len().abs_diff(expected.len());
+        eprintln!("{case}: {mismatches} mismatched samples");
+        assert_eq!(actual, expected, "{case}");
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn damaged_conformed_audio_recovers_nonzero_samples() {
+        for length in [0, 1, 16, 63, 72] {
+            let (dir, footage, pool, file, mut bytes) = conform_fixture(&format!("damaged-{length}"));
+            let expected = [0.25, -0.5, 0.25, -0.5, 0.25, -0.5, 0.25, -0.5];
+            let tail = [0.25, -0.5, 0.25, -0.5, 0.0, 0.0, 0.0, 0.0];
+            bytes.resize(length, 0);
+            std::fs::write(&file, bytes).unwrap();
+            let decoder = MediaPool::new();
+            assert_conform_samples("decoder", &decoder.audio_samples(&footage, sample_time(1, 8000), 4, 8000), &expected);
+            assert_conform_samples("decoder tail", &decoder.audio_samples(&footage, sample_time(6, 8000), 4, 8000), &tail);
+            let immediate = pool.audio_samples(&footage, sample_time(1, 8000), 4, 8000);
+            let immediate_tail = pool.audio_samples(&footage, sample_time(6, 8000), 4, 8000);
+            settle_conform(&pool);
+            assert_conform_samples(&format!("{length} bytes immediate"), &immediate, &expected);
+            assert_conform_samples(&format!("{length} bytes immediate tail"), &immediate_tail, &tail);
+            assert_eq!(std::fs::metadata(&file).unwrap().len(), 64);
+            assert_conform_samples("repaired", &pool.audio_samples(&footage, sample_time(1, 8000), 4, 8000), &expected);
+            assert_conform_samples("repaired tail", &pool.audio_samples(&footage, sample_time(6, 8000), 4, 8000), &tail);
+            let fresh = MediaPool::new();
+            fresh.set_conform_folder(Some(dir.join("cache")));
+            assert_conform_samples("fresh pool", &fresh.audio_samples(&footage, sample_time(1, 8000), 4, 8000), &expected);
+            assert_conform_samples("fresh pool tail", &fresh.audio_samples(&footage, sample_time(6, 8000), 4, 8000), &tail);
+            settle_conform(&pool);
+            settle_conform(&fresh);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn conformed_audio_preserves_valid_hits_and_outside_silence() {
+        let (dir, footage, pool, file, bytes) = conform_fixture("valid");
+        std::fs::write(&file, &bytes).unwrap();
+        let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+        let decoder = MediaPool::new();
+        for (at, expected) in [
+            (1, [0.25, -0.5, 0.25, -0.5, 0.25, -0.5, 0.25, -0.5]),
+            (6, [0.25, -0.5, 0.25, -0.5, 0.0, 0.0, 0.0, 0.0]),
+            (-2, [0.0, 0.0, 0.0, 0.0, 0.25, -0.5, 0.25, -0.5]),
+            (-8, [0.0; 8]),
+            (8, [0.0; 8]),
+        ] {
+            let time = Tick::from_units(at, 8000);
+            assert_eq!(decoder.audio_samples(&footage, time, 4, 8000), expected);
+            assert_eq!(pool.audio_samples(&footage, time, 4, 8000), expected);
+        }
+        assert!(lock(&pool.inner.conforming).is_empty());
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), modified);
+        assert!(MediaPool::read_conformed(&file, usize::MAX, 0, 0).is_none());
+        assert!(MediaPool::read_conformed(&file, 8, usize::MAX, 1).is_none());
+        assert!(MediaPool::read_conformed(&file, 8, 0, usize::MAX).is_none());
+        std::fs::write(&file, []).unwrap();
+        assert_eq!(MediaPool::read_conformed(&file, 0, 0, 4), Some(vec![0.0; 8]));
+        let empty = Footage { duration: Tick::ZERO, ..footage };
+        assert_eq!(pool.audio_samples(&empty, Tick::ZERO, 4, 8000), [0.0; 8]);
+        assert!(lock(&pool.inner.conforming).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn unreadable_conformed_audio_and_failed_recovery_keep_source_audio() {
+        for mode in ["destination-directory", "temporary-directory", "parallel"] {
+            let (dir, footage, pool, file, _) = conform_fixture(mode);
+            if mode == "destination-directory" {
+                std::fs::create_dir(&file).unwrap();
+            } else {
+                std::fs::write(&file, [0; 16]).unwrap();
+                if mode == "temporary-directory" {
+                    std::fs::create_dir(file.with_extension("tmp")).unwrap();
+                }
+            }
+            let barrier = std::sync::Barrier::new(8);
+            let samples = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            pool.audio_samples(&footage, sample_time(1, 8000), 4, 8000)
+                        })
+                    })
+                    .collect();
+                workers.into_iter().map(|worker| worker.join().unwrap()).collect::<Vec<_>>()
+            });
+            settle_conform(&pool);
+            for actual in samples {
+                assert_conform_samples(mode, &actual, &[0.25, -0.5, 0.25, -0.5, 0.25, -0.5, 0.25, -0.5]);
+            }
+            let failed = mode != "parallel";
+            assert_eq!(lock(&pool.inner.conform_failed).contains(&file), failed);
+            if !failed {
+                assert_eq!(std::fs::metadata(&file).unwrap().len(), 64);
+            }
+            for _ in 0..3 {
+                assert_eq!(pool.audio_samples(&footage, sample_time(1, 8000), 4, 8000), [0.25, -0.5, 0.25, -0.5, 0.25, -0.5, 0.25, -0.5]);
+                assert!(lock(&pool.inner.conforming).is_empty());
+                assert_eq!(lock(&pool.inner.conform_failed).contains(&file), failed);
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     /// Conforming a long file's audio reads every chunk at its own time: the sample index times
     /// ticks per second overflowed `i64` past 12:36 at 48 kHz, and later chunks came out silent
