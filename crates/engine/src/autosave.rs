@@ -256,21 +256,32 @@ pub fn end(store: &dyn ConfigStore) {
     let _ = store.remove(SENTINEL);
 }
 
+pub(crate) const MAX_INCREMENT_PROBES: usize = 1024;
+
 /// After Effects' Increment and Save name: `Intro.ecproj` → `Intro 2.ecproj`, `Intro 2.ecproj`
 /// → `Intro 3.ecproj` (skipping names that exist; the extension, `.ecprojx` too, is kept).
-pub fn increment_path(path: &str, exists: impl Fn(&str) -> bool) -> String {
+pub fn increment_path(path: &str, exists: impl Fn(&str) -> bool) -> crate::Result<String> {
     let p = Path::new(path);
     let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let ext = p.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| EXT.to_string());
+    let error = |reason: &str| crate::EngineError::Other(format!("cannot increment {path}: {reason}; use Save As with a different name"));
+    let exhausted = || error("version numbering exhausted at 4294967295");
     let (base, mut n) = match stem.rsplit_once(' ') {
-        Some((b, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => (b.to_string(), n.parse::<u32>().unwrap_or(1) + 1),
+        Some((b, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
+            let version = n.parse::<u32>().map_err(|_| error("version suffix exceeds u32 range"))?;
+            (b.to_string(), version.checked_add(1).ok_or_else(exhausted)?)
+        }
         _ => (stem.clone(), 2),
     };
-    loop {
+    for probe in 0..MAX_INCREMENT_PROBES {
         let cand = p.with_file_name(format!("{base} {n}.{ext}")).to_string_lossy().to_string();
         if !exists(&cand) {
-            return cand;
+            return Ok(cand);
         }
-        n += 1;
+        if probe == MAX_INCREMENT_PROBES - 1 {
+            break;
+        }
+        n = n.checked_add(1).ok_or_else(exhausted)?;
     }
+    Err(error(&format!("no free version in {MAX_INCREMENT_PROBES} candidates")))
 }

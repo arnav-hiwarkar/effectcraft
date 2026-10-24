@@ -977,9 +977,161 @@ fn open_recent_increment_and_revert() {
     assert!(s.prefs.recent_projects[0].ends_with("A.ecproj"));
     s.execute("file.clearRecent", json!({})).unwrap();
     assert!(!s.is_enabled("file.openRecent"));
-    assert_eq!(std::path::PathBuf::from(autosave::increment_path("/x/Intro 9.ecproj", |_| false)), std::path::PathBuf::from("/x/Intro 10.ecproj"));
-    assert_eq!(std::path::PathBuf::from(autosave::increment_path("/x/v1.ecproj", |p| p.ends_with("v1 2.ecproj"))), std::path::PathBuf::from("/x/v1 3.ecproj"));
+    assert_eq!(std::path::PathBuf::from(autosave::increment_path("/x/Intro 9.ecproj", |_| false).unwrap()), std::path::PathBuf::from("/x/Intro 10.ecproj"));
+    assert_eq!(
+        std::path::PathBuf::from(autosave::increment_path("/x/v1.ecproj", |p| p.ends_with("v1 2.ecproj")).unwrap()),
+        std::path::PathBuf::from("/x/v1 3.ecproj")
+    );
     let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn increment_save_errors_preserve_document() {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Files {
+        config: MemoryConfig,
+        projects: Mutex<BTreeMap<String, Vec<u8>>>,
+        writes: AtomicUsize,
+        probes: AtomicUsize,
+        always_occupied: bool,
+    }
+    impl crate::Services for Files {
+        fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+            self.projects.lock().unwrap().get(path).cloned().ok_or_else(|| std::io::ErrorKind::NotFound.into())
+        }
+        fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.projects.lock().unwrap().insert(path.to_string(), data.to_vec());
+            Ok(())
+        }
+        fn exists(&self, path: &str) -> bool {
+            self.projects.lock().unwrap().contains_key(path)
+        }
+    }
+    impl ConfigStore for Files {
+        fn read(&self, name: &str) -> Option<String> {
+            self.config.read(name)
+        }
+        fn write(&self, name: &str, data: &str) -> std::io::Result<()> {
+            self.config.write(name, data)
+        }
+        fn remove(&self, name: &str) -> std::io::Result<()> {
+            self.config.remove(name)
+        }
+        fn files(&self) -> &dyn crate::config::FileOps {
+            self
+        }
+    }
+    impl crate::config::FileOps for Files {
+        fn list(&self, _: &Path) -> Vec<(String, std::time::SystemTime)> {
+            vec![]
+        }
+        fn write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+            crate::Services::write_file(self, &path.to_string_lossy(), data)
+        }
+        fn remove(&self, path: &Path) -> std::io::Result<()> {
+            self.projects.lock().unwrap().remove(path.to_string_lossy().as_ref());
+            Ok(())
+        }
+        fn is_file(&self, path: &Path) -> bool {
+            self.probes.fetch_add(1, Ordering::Relaxed);
+            self.always_occupied || self.projects.lock().unwrap().contains_key(path.to_string_lossy().as_ref())
+        }
+    }
+
+    for (path, occupied, always_occupied, reason, expected_probes) in [
+        ("/x/Intro 4294967295.ecproj", None, false, "version numbering exhausted at 4294967295", 0),
+        ("/x/Intro 4294967294.ecproj", Some("/x/Intro 4294967295.ecproj"), false, "version numbering exhausted at 4294967295", 1),
+        ("/x/Intro 4294967296.ecproj", None, false, "version suffix exceeds u32 range", 0),
+        ("/x/Intro.ecproj", None, true, "no free version in 1024 candidates", 1024),
+    ] {
+        let files = Arc::new(Files { always_occupied, ..Default::default() });
+        let mut s = session_with_comp();
+        s.services = files.clone();
+        s.config = Some(files.clone());
+        s.execute("file.saveAs", json!({"path": path})).unwrap();
+        assert_eq!(files.writes.load(Ordering::Relaxed), 1);
+        if let Some(occupied) = occupied {
+            files.projects.lock().unwrap().insert(occupied.to_string(), b"prior version".to_vec());
+        }
+        s.execute("layer.newNull", json!({"name": "unsaved work"})).unwrap();
+        let prior_files = files.projects.lock().unwrap().clone();
+        let prior_json = s.project.to_file_json().unwrap();
+        let prior_path = s.path.clone();
+        let prior_dirty = s.is_dirty();
+        assert!(prior_dirty);
+        let prior_recent = s.prefs.recent_projects.clone();
+        files.writes.store(0, Ordering::Relaxed);
+        files.probes.store(0, Ordering::Relaxed);
+
+        let error = s.execute("file.incrementAndSave", json!({})).unwrap_err().to_string();
+        assert!(error.contains(reason), "{error}");
+        assert!(error.contains(path), "{error}");
+        assert!(error.contains("use Save As with a different name"), "{error}");
+        let probes = files.probes.load(Ordering::Relaxed);
+        assert_eq!(probes, expected_probes, "{path}");
+        println!("{path}: {probes} probes");
+        assert_eq!(files.writes.load(Ordering::Relaxed), 0);
+        assert_eq!(s.project.to_file_json().unwrap(), prior_json);
+        assert_eq!(s.path, prior_path);
+        assert_eq!(s.is_dirty(), prior_dirty);
+        assert_eq!(s.prefs.recent_projects, prior_recent);
+        assert_eq!(*files.projects.lock().unwrap(), prior_files);
+    }
+}
+
+#[test]
+fn increment_path_bounds_and_parity() {
+    use std::cell::Cell;
+
+    for (input, expected) in [
+        ("/x/Intro 4294967294.ecproj", "/x/Intro 4294967295.ecproj"),
+        ("/x/Intro 9.ecprojx", "/x/Intro 10.ecprojx"),
+        ("/x/Intro 9.xml", "/x/Intro 10.xml"),
+        ("/x/Intro 0.ecproj", "/x/Intro 1.ecproj"),
+        ("/x/Intro 009.ecproj", "/x/Intro 10.ecproj"),
+        ("/x/Intro nine.ecproj", "/x/Intro nine 2.ecproj"),
+        ("/x/導入.ecproj", "/x/導入 2.ecproj"),
+        ("/x/Intro", "/x/Intro 2.ecproj"),
+    ] {
+        let probes = Cell::new(0);
+        assert_eq!(
+            autosave::increment_path(input, |_| {
+                probes.set(probes.get() + 1);
+                false
+            })
+            .unwrap(),
+            expected
+        );
+        assert_eq!(probes.get(), 1);
+    }
+    let probes = Cell::new(0);
+    assert_eq!(
+        autosave::increment_path("/x/v1.ecproj", |path| {
+            probes.set(probes.get() + 1);
+            path == "/x/v1 2.ecproj"
+        })
+        .unwrap(),
+        "/x/v1 3.ecproj"
+    );
+    assert_eq!(probes.get(), 2);
+
+    let probes = Cell::new(0);
+    assert_eq!(
+        autosave::increment_path("/x/Intro.ecproj", |_| {
+            probes.set(probes.get() + 1);
+            probes.get() < 1024
+        })
+        .unwrap(),
+        "/x/Intro 1025.ecproj"
+    );
+    assert_eq!(probes.get(), 1024);
+    println!("free final candidate: {} probes", probes.get());
 }
 
 #[test]

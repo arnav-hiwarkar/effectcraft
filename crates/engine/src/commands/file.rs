@@ -114,7 +114,7 @@ fn save_as(s: &mut Session, p: &Value) -> Result<Value> {
 fn increment_save(s: &mut Session, _: &Value) -> Result<Value> {
     let cur = s.path.clone().ok_or_else(|| bad("file.incrementAndSave", "save the project first"))?;
     // After Effects: `Intro.aep` → `Intro 2.aep` → `Intro 3.aep`.
-    let next = crate::autosave::increment_path(&cur, |p| s.file_ops().is_file(std::path::Path::new(p)));
+    let next = crate::autosave::increment_path(&cur, |p| s.file_ops().is_file(std::path::Path::new(p)))?;
     save_to(s, &next)
 }
 
