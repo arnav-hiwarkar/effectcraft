@@ -1443,6 +1443,7 @@ name = "effectcraft-media"
 version = "0.13.0"
 dependencies = [
  "craft-docpath",
+ "effectcraft-memory",
  "effectcraft-model",
  "effectcraft-pdf",
  "effectcraft-project",
@@ -1466,6 +1467,10 @@ dependencies = [
  "symphonia",
  "thiserror 2.0.21",
 ]
+
+[[package]]
+name = "effectcraft-memory"
+version = "0.13.0"
 
 [[package]]
 name = "effectcraft-model"
@@ -1563,6 +1568,7 @@ dependencies = [
  "effectcraft-effects",
  "effectcraft-geom",
  "effectcraft-keyframe",
+ "effectcraft-memory",
  "effectcraft-model",
  "effectcraft-path",
  "effectcraft-project",

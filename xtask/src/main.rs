@@ -25,6 +25,7 @@ use serde_json::Value;
 /// (crate name without the `effectcraft-` prefix, layer). See `docs/architecture.md` §1.
 const LAYERS: &[(&str, u8)] = &[
     ("time", 0),
+    ("memory", 0),
     ("geom", 0),
     ("color", 0),
     ("vp9enc", 0),

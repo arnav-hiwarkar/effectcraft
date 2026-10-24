@@ -10,6 +10,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+effectcraft-memory = { workspace = true }
 craft-docpath = { workspace = true }
 effectcraft-time = { workspace = true }
 effectcraft-project = { workspace = true }

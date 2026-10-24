@@ -255,6 +255,20 @@ impl Drop for Inflight<'_> {
     }
 }
 
+impl effectcraft_memory::Budgeted for MediaPool {
+    fn bytes(&self) -> usize {
+        MediaPool::stats(self).bytes
+    }
+
+    fn set_budget(&self, bytes: usize) {
+        MediaPool::set_budget(self, bytes);
+    }
+
+    fn tier(&self) -> effectcraft_memory::Tier {
+        effectcraft_memory::Tier::Footage
+    }
+}
+
 impl MediaPool {
     /// A pool with the [`DEFAULT_BUDGET`] frame cache.
     pub fn new() -> Self {
@@ -1059,6 +1073,48 @@ mod tests {
         assert_eq!(c.spare.len(), MAX_SPARE);
         assert_eq!(c.take_spare(256).len(), 256);
         assert!(c.take_spare(17).is_empty());
+    }
+
+    #[test]
+    fn budgeted_media_reports_bytes_and_preserves_newest_frame() {
+        use effectcraft_memory::{Budgeted, Tier};
+
+        let pool = MediaPool::with_budget(65536);
+        let budgeted: &dyn Budgeted = &pool;
+        let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3], size: (0, 0) };
+        let img = || Arc::new(Image::new(16, 16));
+        assert_eq!(budgeted.bytes(), 0);
+        assert_eq!(budgeted.tier(), Tier::Footage);
+
+        {
+            let mut c = lock(&pool.inner.cache);
+            c.lru.insert(k(1), img(), pool.budget());
+            c.lru.insert(k(2), img(), pool.budget());
+        }
+        assert_eq!(budgeted.bytes(), 8320);
+        {
+            let mut c = lock(&pool.inner.cache);
+            c.lru.insert(k(1), img(), pool.budget());
+        }
+        assert_eq!(budgeted.bytes(), 8320);
+        assert!(lock(&pool.inner.cache).lru.get(&k(1)).is_some());
+        assert_eq!(budgeted.bytes(), 8320);
+        assert_eq!(budgeted.bytes(), 8320);
+
+        budgeted.set_budget(4160);
+        assert_eq!(pool.budget(), 4160);
+        assert_eq!(budgeted.bytes(), 4160);
+        {
+            let mut c = lock(&pool.inner.cache);
+            assert!(c.lru.get(&k(1)).is_some());
+            assert!(c.lru.get(&k(2)).is_none());
+        }
+        budgeted.set_budget(0);
+        assert_eq!(pool.budget(), 0);
+        assert_eq!(budgeted.bytes(), 4160);
+        assert_eq!(pool.stats().frames, 1);
+        pool.clear_frames();
+        assert_eq!(budgeted.bytes(), 0);
     }
 
     /// #482: an OpenEXR file with HTJ2K compression (which the decoder lacks) says so on import

@@ -15,6 +15,7 @@ craft-pdf = { git = "https://github.com/storytold/craft-libs", rev = "ca50d63b77
 craft-docpath = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "82a24b006eefa036b43c09a67fb9a3fbd17ffe63" }
 # internal
 effectcraft-time = { path = "crates/time" }
+effectcraft-memory = { path = "crates/memory" }
 effectcraft-geom = { path = "crates/geom" }
 effectcraft-color = { path = "crates/color" }
 effectcraft-raster = { path = "crates/raster" }

@@ -251,6 +251,20 @@ impl LayerCache {
     }
 }
 
+impl effectcraft_memory::Budgeted for LayerCache {
+    fn bytes(&self) -> usize {
+        LayerCache::stats(self).bytes
+    }
+
+    fn set_budget(&self, bytes: usize) {
+        LayerCache::set_budget(self, bytes);
+    }
+
+    fn tier(&self) -> effectcraft_memory::Tier {
+        effectcraft_memory::Tier::Layer
+    }
+}
+
 /// Persistent storage of layer buffers behind a [`LayerCache`] (keys salted per project).
 pub trait LayerStore: Send + Sync {
     /// A stored buffer (synchronous: mid-render).
@@ -667,4 +681,38 @@ pub fn derive(key: u64, i: u64) -> u64 {
     let mut h = KeyHasher(key);
     i.hash(&mut h);
     h.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use effectcraft_memory::{Budgeted, Tier};
+    use effectcraft_raster::Image;
+
+    #[test]
+    fn budgeted_layer_reports_bytes_and_preserves_shrink_lru() {
+        let cache = LayerCache::new(65536);
+        let budgeted: &dyn Budgeted = &cache;
+        let buf = |w, h| Arc::new(Buf { img: Image::new(w, h), offset: [0.0; 2], scale: 1.0 });
+        assert_eq!(budgeted.bytes(), 0);
+        assert_eq!(budgeted.tier(), Tier::Layer);
+
+        cache.insert(1, buf(16, 16));
+        cache.insert(2, buf(32, 16));
+        assert_eq!(budgeted.bytes(), 12288);
+        cache.insert(1, buf(16, 16));
+        assert_eq!(budgeted.bytes(), 12288);
+        assert!(cache.get(1).is_some());
+        assert_eq!(budgeted.bytes(), 12288);
+        assert_eq!(budgeted.bytes(), 12288);
+
+        budgeted.set_budget(8192);
+        assert_eq!(cache.budget(), 8192);
+        assert_eq!(budgeted.bytes(), 4096);
+        assert!(cache.get(1).is_some());
+        assert!(cache.get(2).is_none());
+        budgeted.set_budget(0);
+        assert_eq!(budgeted.bytes(), 0);
+        assert!(cache.get(1).is_none());
+    }
 }
