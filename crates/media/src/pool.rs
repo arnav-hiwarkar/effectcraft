@@ -1048,6 +1048,8 @@ mod tests {
         assert_eq!(std::fs::read(&file).unwrap(), bytes);
         assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), modified);
         assert!(MediaPool::read_conformed(&file, usize::MAX, 0, 0).is_none());
+        assert_eq!(MediaPool::read_conformed(&file, 8, 9, 1), Some(vec![0.0; 2]));
+        #[cfg(target_pointer_width = "64")]
         assert!(MediaPool::read_conformed(&file, 8, usize::MAX, 1).is_none());
         assert!(MediaPool::read_conformed(&file, 8, 0, usize::MAX).is_none());
         std::fs::write(&file, []).unwrap();
