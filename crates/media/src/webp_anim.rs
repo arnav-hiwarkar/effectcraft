@@ -167,6 +167,9 @@ pub(crate) fn load(bytes: &[u8]) -> Result<Anim> {
                 break;
             }
         };
+        if frames.len() >= MAX_FRAMES {
+            return Err(MediaError::Unsupported(format!("animated WebP exceeds the {MAX_FRAMES}-frame limit")));
+        }
         let (numer, denom) = frame.delay().numer_denom_ms();
         delays.push(numer.checked_div(denom).unwrap_or(0));
         let buf = frame.into_buffer();
@@ -240,6 +243,46 @@ mod tests {
 
     fn pixel_at(pool: &MediaPool, f: &Footage, seconds: f64) -> [f32; 4] {
         pool.frame_at(f, Tick::from_seconds_f64(seconds)).unwrap().data[0]
+    }
+
+    fn repeated_webp(red_frames: usize) -> Vec<u8> {
+        let frame = |rgba| {
+            let mut anmf = vec![0; 12];
+            anmf.extend_from_slice(&u24(20));
+            anmf.push(0b10);
+            anmf.extend(vp8l(1, 1, rgba));
+            chunk(b"ANMF", &anmf)
+        };
+        let red = frame(RED);
+        let green = frame(GREEN);
+        let mut body = b"WEBP".to_vec();
+        body.extend(chunk(b"VP8X", &[0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+        body.extend(chunk(b"ANIM", &[0; 6]));
+        for _ in 0..red_frames {
+            body.extend_from_slice(&red);
+        }
+        body.extend_from_slice(&green);
+        chunk(b"RIFF", &body)
+    }
+
+    #[test]
+    fn frame_limit_accepts_boundary_and_rejects_extra_frame() {
+        let bytes = repeated_webp(super::MAX_FRAMES - 1);
+        let footage = super::probe("limit.webp", &bytes).unwrap();
+        assert_eq!(footage.kind, FootageKind::Video);
+        assert_eq!(footage.duration, Tick::from_units(2_000_000, 1000));
+        let anim = super::load(&bytes).unwrap();
+        for (ms, rgba) in [(1_999_960, RED), (1_999_980, GREEN), (2_000_020, GREEN)] {
+            assert_eq!(anim.frame_at(Tick::from_units(ms, 1000)).unwrap().to_rgba8().get_pixel(0, 0).0, rgba);
+        }
+        drop(anim);
+
+        let bytes = repeated_webp(super::MAX_FRAMES);
+        match super::load(&bytes) {
+            Err(crate::MediaError::Unsupported(message)) => assert_eq!(message, "animated WebP exceeds the 100000-frame limit"),
+            Err(error) => panic!("unexpected error: {error}"),
+            Ok(_) => panic!("animated WebP with 100001 frames was accepted"),
+        }
     }
 
     #[test]
