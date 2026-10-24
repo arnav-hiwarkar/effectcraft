@@ -46,13 +46,13 @@ fn draw_group(g: &Group, m: Affine, opacity: f64, dst: &mut Image) {
     // Draw the children on their own (isolated) or over a copy of the backdrop, keep what
     // every clip path covers and the soft mask lets through, then composite with the group's
     // opacity and blend mode.
-    let backdrop = if g.isolated { None } else { Some(dst.clone()) };
-    let mut tmp = match &backdrop {
+    let backdrop: Option<&Image> = if g.isolated { None } else { Some(&*dst) };
+    let mut tmp = match backdrop {
         Some(b) => b.clone(),
         None => Image::new(dst.width, dst.height),
     };
-    draw_children(g, m, &mut tmp, backdrop.as_ref());
-    if let Some(b) = &backdrop {
+    draw_children(g, m, &mut tmp, backdrop);
+    if let Some(b) = backdrop {
         if only_clip {
             // A non-isolated clipping group: the backdrop where the clip excludes the children.
             let cov = clip_coverage(g, m, dst.width, dst.height);
@@ -522,4 +522,78 @@ pub(crate) fn eval_stops(stops: &[(f64, [f64; 4])], t: f64) -> [f32; 4] {
         }
     }
     stops.last().map_or([0.0; 4], |s| s.1.map(|v| v as f32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn nested_nonisolated_doc() -> Doc {
+        let rectangle = |color| {
+            Node::Shape(Shape {
+                name: "rectangle".into(),
+                geom: crate::Geom::Rect { x: 0.0, y: 0.0, w: 8.0, h: 4.0, rx: 0.0, ry: 0.0 },
+                transform: Affine::IDENTITY,
+                fill: Some(Paint::Color(color)),
+                fill_opacity: 1.0,
+                fill_rule: FillRule::NonZero,
+                stroke: None,
+                opacity: 1.0,
+            })
+        };
+        let mut inner = Group::new("multiply");
+        inner.isolated = false;
+        inner.blend = BlendMode::Multiply;
+        inner.opacity = 0.5;
+        inner.clip.push((kurbo::Rect::new(2.0, 0.0, 6.0, 4.0).to_path(0.01), FillRule::NonZero));
+        inner.children.push(rectangle([0.0, 1.0, 1.0]));
+
+        let mut outer = Group::new("outer clip");
+        outer.isolated = false;
+        outer.clip.push((kurbo::Rect::new(1.0, 0.0, 7.0, 4.0).to_path(0.01), FillRule::NonZero));
+        outer.children.push(Node::Group(inner));
+
+        let mut root = Group::new("root");
+        root.children = vec![rectangle([1.0, 1.0, 0.0]), Node::Group(outer)];
+        Doc { width: 8.0, height: 4.0, root, skipped: vec![] }
+    }
+
+    #[test]
+    fn nested_nonisolated_groups_preserve_backdrop() {
+        let image = rasterize(&nested_nonisolated_doc(), 8, 4, 1.0);
+        let row = [
+            [1.0, 1.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0, 1.0],
+            [0.5, 1.0, 0.0, 1.0],
+            [0.5, 1.0, 0.0, 1.0],
+            [0.5, 1.0, 0.0, 1.0],
+            [0.5, 1.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0, 1.0],
+        ];
+        let expected = row.repeat(4);
+        assert_eq!((image.width, image.height), (8, 4));
+        assert_eq!(image.data.len(), expected.len());
+        for (index, (actual, expected)) in image.data.iter().zip(&expected).enumerate() {
+            for (component, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert!((actual - expected).abs() <= 1e-6, "pixel {index}, component {component}: {actual} != {expected}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "run separately to compare complete pixels and peak RSS against the base"]
+    fn perf93_nested_backdrop_measurement() -> Result<(), Box<dyn std::error::Error>> {
+        let output = std::env::var_os("PERF93_OUTPUT").ok_or("PERF93_OUTPUT must name the pixel output file")?;
+        let image = rasterize_with(&nested_nonisolated_doc(), 1024, 1024, Affine::scale_non_uniform(128.0, 256.0));
+        let mut file = std::io::BufWriter::new(std::fs::File::create(output)?);
+        for pixel in &image.data {
+            for component in pixel {
+                file.write_all(&component.to_bits().to_le_bytes())?;
+            }
+        }
+        file.flush()?;
+        Ok(())
+    }
 }
