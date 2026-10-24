@@ -406,7 +406,7 @@ fn time_displacement(ctx: &EffectCtx, b: Buf) -> Buf {
     let stretch = ctx.params.b("stretchMap");
     let Some(mut cur) = fetch(ctx, &[ctx.time]) else { return b };
     let cur_img = cur.imgs.pop().unwrap_or_default();
-    let mut grid = with_img(cur.grid, cur_img);
+    let grid = with_img(cur.grid, cur_img);
     let map = match ctx.layer_param("displacementMapLayer", true) {
         Some(o) => fit_layer(ctx, &grid, &o, stretch),
         None => grid.img.clone(),
@@ -433,6 +433,10 @@ fn time_displacement(ctx: &EffectCtx, b: Buf) -> Buf {
     }
     let times: Vec<f64> = keys.iter().map(|k| ctx.time + *k as f64 * step).collect();
     let Some(fr) = fetch(ctx, &times) else { return grid };
+    displace_into(grid, &idx, &keys, &fr)
+}
+
+fn displace_into(mut grid: Buf, idx: &[i32], keys: &[i32], fr: &Frames) -> Buf {
     // Frames come back on the union grid; map the current grid into it.
     let dx = (fr.grid.offset[0] - grid.offset[0]).round() as i64;
     let dy = (fr.grid.offset[1] - grid.offset[1]).round() as i64;
@@ -1306,6 +1310,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn time_displacement_zero_width_preserves_geometry() {
+        let grid = Buf { img: Image::new(0, 1), offset: [7.5, -3.25], scale: 2.0 };
+        let fr = Frames { grid: grid.clone(), imgs: Vec::new() };
+
+        let out = displace_into(grid, &[], &[], &fr);
+
+        assert_eq!(out.img.width, 0);
+        assert_eq!(out.img.height, 1);
+        assert!(out.img.data.is_empty());
+        assert_eq!(out.offset, [7.5, -3.25]);
+        assert_eq!(out.scale, 2.0);
     }
 
     #[test]
