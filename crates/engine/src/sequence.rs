@@ -11,6 +11,8 @@
 //! The browser has no folders: its file table lists the files picked or dropped so far, so
 //! picking every frame of a sequence imports it there too.
 
+use std::collections::{HashMap, hash_map::Entry};
+
 use effectcraft_project::sequence::{frame_number, missing_frame_ranges, sequence_name, split_frame_number};
 use effectcraft_project::{Footage, FootageKind};
 use effectcraft_time::FrameRate;
@@ -127,24 +129,45 @@ fn sort_run(files: &mut Vec<String>, alphabetical: bool) {
     files.dedup();
 }
 
-/// The files of the run `path` belongs to, from its folder.
-fn run_files(services: &dyn Services, path: &str, alphabetical: bool) -> Vec<String> {
-    let Some(key) = run_key(path, alphabetical) else { return vec![] };
-    let mut files: Vec<String> = services.list_dir(&key.0).into_iter().filter(|p| run_key(p, alphabetical).as_ref() == Some(&key)).collect();
-    sort_run(&mut files, alphabetical);
-    files
+/// Retain each directory snapshot and index its runs once per import.
+fn index_directory<'a>(
+    services: &dyn Services,
+    dir: &str,
+    alphabetical: bool,
+    listings: &'a mut HashMap<String, Vec<String>>,
+    index: &mut HashMap<(String, String, String), Vec<String>>,
+) -> &'a Vec<String> {
+    match listings.entry(dir.to_string()) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            let files = services.list_dir(dir);
+            let mut runs: HashMap<_, Vec<String>> = HashMap::new();
+            for file in &files {
+                if let Some(key) = run_key(file, alphabetical) {
+                    runs.entry(key).or_default().push(file.clone());
+                }
+            }
+            index.extend(runs);
+            entry.insert(files)
+        }
+    }
 }
 
 /// What importing `paths` makes, in the order picked: folders become their importable files,
 /// and (with the Sequence option, or [`SequenceOptions::folders`] for a folder's files) numbered
 /// stills of one run one [`Source::Sequence`].
 pub fn group(services: &dyn Services, paths: &[String], opts: SequenceOptions) -> Vec<Source> {
+    let mut listings = HashMap::new();
+    let mut index = HashMap::new();
     // Each file, and whether it may join a sequence.
     let mut files: Vec<(String, bool)> = vec![];
     for p in paths {
         if services.is_dir(p) {
-            let mut inside: Vec<String> =
-                services.list_dir(p).into_iter().filter(|f| matches!(crate::media_browser::kind_of(f), Some(k) if k != "project")).collect();
+            let mut inside: Vec<String> = index_directory(services, p, opts.alphabetical, &mut listings, &mut index)
+                .iter()
+                .filter(|f| matches!(crate::media_browser::kind_of(f), Some(k) if k != "project"))
+                .cloned()
+                .collect();
             inside.sort_by_key(|f| file_name(f).to_lowercase());
             files.extend(inside.into_iter().map(|f| (f, opts.folders)));
         } else {
@@ -168,13 +191,15 @@ pub fn group(services: &dyn Services, paths: &[String], opts: SequenceOptions) -
             None => out.push(Some(Source::File(f))),
         }
     }
-    for ((_, mut picked), at) in runs.into_iter().zip(slot) {
+    for ((key, mut picked), at) in runs.into_iter().zip(slot) {
         sort_run(&mut picked, opts.alphabetical);
         // One picked file: its whole run from the folder.
-        if let [one] = picked.as_slice()
-            && opts.sequence
-        {
-            let all = run_files(services, one, opts.alphabetical);
+        if picked.len() == 1 && opts.sequence {
+            if !index.contains_key(&key) {
+                index_directory(services, &key.0, opts.alphabetical, &mut listings, &mut index);
+            }
+            let mut all = index.get(&key).cloned().unwrap_or_default();
+            sort_run(&mut all, opts.alphabetical);
             if all.len() >= 2 {
                 picked = all;
             }
@@ -277,6 +302,107 @@ mod tests {
 
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    struct CountingTable {
+        files: std::sync::Mutex<Vec<String>>,
+        dirs: Vec<String>,
+        listings: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CountingTable {
+        fn new(files: Vec<String>, dirs: &[&str]) -> Self {
+            Self { files: std::sync::Mutex::new(files), dirs: strs(dirs), listings: std::sync::Mutex::new(vec![]) }
+        }
+
+        fn take_listings(&self) -> Vec<String> {
+            std::mem::take(&mut *self.listings.lock().unwrap())
+        }
+    }
+
+    impl Services for CountingTable {
+        fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+            Err(std::io::Error::other(path.to_string()))
+        }
+        fn write_file(&self, _: &str, _: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn list_dir(&self, dir: &str) -> Vec<String> {
+            self.listings.lock().unwrap().push(dir.to_string());
+            self.files.lock().unwrap().iter().filter(|p| folder(p) == dir.trim_end_matches(['/', '\\'])).cloned().collect()
+        }
+        fn is_dir(&self, path: &str) -> bool {
+            self.dirs.iter().any(|d| d == path)
+        }
+    }
+
+    #[test]
+    fn directory_index_reuses_listings() {
+        let files = (0..100).flat_map(|r| (1..=2).map(move |f| format!("/s/r{r:03}_{f:04}.png"))).rev().collect();
+        let t = CountingTable::new(files, &["/s"]);
+        let picks = (0..100).rev().map(|r| format!("/s/r{r:03}_0002.png")).collect::<Vec<_>>();
+        let picked = group(&t, &picks, SequenceOptions::default());
+        let picked_listings = t.take_listings();
+        let t = CountingTable::new((0..100).rev().map(|r| format!("/s/r{r:03}_0001.png")).collect(), &["/s"]);
+        let imported = group(&t, &strs(&["/s"]), SequenceOptions::default());
+        let folder_listings = t.take_listings();
+        eprintln!("directory listings: picked={}, folder={}", picked_listings.len(), folder_listings.len());
+        let expected = (0..100)
+            .rev()
+            .map(|r| Source::Sequence { files: vec![format!("/s/r{r:03}_0001.png"), format!("/s/r{r:03}_0002.png")], alphabetical: false })
+            .collect::<Vec<_>>();
+        assert_eq!(picked, expected);
+        assert_eq!(imported, (0..100).map(|r| Source::File(format!("/s/r{r:03}_0001.png"))).collect::<Vec<_>>());
+        assert_eq!(picked_listings, strs(&["/s"]));
+        assert_eq!(folder_listings, strs(&["/s"]));
+    }
+
+    #[test]
+    fn directory_index_preserves_options_and_refreshes() {
+        let t = CountingTable::new(strs(&["/s/a_3.png", "/s/a_2.png", "/s/a_1.png", "/s/b_2.png", "/s/b_1.png", "/x/c_2.png", "/x/c_1.png"]), &["/s"]);
+        let on = SequenceOptions::default();
+        let seq = |paths: &[&str]| Source::Sequence { files: strs(paths), alphabetical: false };
+        assert_eq!(
+            group(&t, &strs(&["/s/a_3.png", "/s/b_2.png", "/s/a_1.png", "/x/c_2.png", "/s/b_2.png"]), on),
+            [seq(&["/s/a_1.png", "/s/a_3.png"]), seq(&["/s/b_1.png", "/s/b_2.png"]), seq(&["/x/c_1.png", "/x/c_2.png"]),]
+        );
+        assert_eq!(t.take_listings(), strs(&["/s", "/x"]));
+        let t = CountingTable::new(strs(&["/s/z.png", "/s/a_2.png", "/s/a_1.png", "/s/a_3.jpg"]), &["/s"]);
+        assert_eq!(
+            group(&t, &strs(&["/s/z.png"]), SequenceOptions { alphabetical: true, ..on }),
+            [Source::Sequence { files: strs(&["/s/a_1.png", "/s/a_2.png", "/s/z.png"]), alphabetical: true },]
+        );
+        assert_eq!(t.take_listings(), strs(&["/s"]));
+        let off = SequenceOptions { sequence: false, folders: false, alphabetical: false };
+        assert_eq!(group(&t, &strs(&["/s/a_2.png", "/s/a_1.png"]), off), [Source::File("/s/a_2.png".into()), Source::File("/s/a_1.png".into())]);
+        assert!(t.take_listings().is_empty());
+        assert_eq!(
+            group(&t, &strs(&["/s"]), off),
+            [Source::File("/s/a_1.png".into()), Source::File("/s/a_2.png".into()), Source::File("/s/a_3.jpg".into()), Source::File("/s/z.png".into()),]
+        );
+        assert_eq!(t.take_listings(), strs(&["/s"]));
+        assert_eq!(
+            group(&t, &strs(&["/s"]), SequenceOptions { sequence: false, ..on }),
+            [seq(&["/s/a_1.png", "/s/a_2.png"]), Source::File("/s/a_3.jpg".into()), Source::File("/s/z.png".into()),]
+        );
+        assert_eq!(t.take_listings(), strs(&["/s"]));
+        let t = CountingTable::new(strs(&[r"C:\r\f_10.exr", r"C:\r\f_2.exr"]), &[]);
+        assert_eq!(group(&t, &strs(&[r"C:\r\f_2.exr"]), on), [seq(&[r"C:\r\f_2.exr", r"C:\r\f_10.exr"])]);
+        assert_eq!(t.take_listings(), strs(&[r"C:\r"]));
+        let t = CountingTable::new(strs(&["/s/a_1.png", "/s/b_1.png"]), &["/s/"]);
+        assert_eq!(group(&t, &strs(&["/s/"]), on), [Source::File("/s/a_1.png".into()), Source::File("/s/b_1.png".into())]);
+        assert_eq!(t.take_listings(), strs(&["/s/"]));
+        let t = CountingTable::new(vec![], &["/s"]);
+        assert_eq!(group(&t, &strs(&["/s/a_1.png", "/s/b_1.png"]), on), [Source::File("/s/a_1.png".into()), Source::File("/s/b_1.png".into())]);
+        assert_eq!(t.take_listings(), strs(&["/s"]));
+        assert_eq!(group(&t, &strs(&["/s", "/s/a_1.png"]), on), [Source::File("/s/a_1.png".into())]);
+        assert_eq!(t.take_listings(), strs(&["/s"]));
+        *t.files.lock().unwrap() = strs(&["/s/a_2.png", "/s/a_1.png"]);
+        assert_eq!(group(&t, &strs(&["/s/a_1.png"]), on), [seq(&["/s/a_1.png", "/s/a_2.png"])]);
+        assert_eq!(t.take_listings(), strs(&["/s"]));
+        t.files.lock().unwrap().push("/s/a_3.png".into());
+        assert_eq!(group(&t, &strs(&["/s/a_1.png"]), on), [seq(&["/s/a_1.png", "/s/a_2.png", "/s/a_3.png"])]);
+        assert_eq!(t.take_listings(), strs(&["/s"]));
     }
 
     #[test]
