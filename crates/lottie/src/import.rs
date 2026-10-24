@@ -54,13 +54,13 @@ fn hex_color(sc: &str) -> [f32; 3] {
 /// The Lottie JSON inside raw bytes (plain JSON, or a stored dotLottie archive).
 fn document(bytes: &[u8]) -> Result<Json, LottieError> {
     if bytes.starts_with(b"PK") {
-        let entries = crate::zip::read_stored(bytes);
+        let entries = crate::zip::read_stored_borrowed(bytes);
         let anim = entries
             .iter()
             .find(|(n, _)| n.starts_with("animations/") && n.ends_with(".json"))
             .or_else(|| entries.iter().find(|(n, _)| n.ends_with(".json") && n != "manifest.json"))
             .ok_or_else(|| LottieError::Parse("dotLottie archive without an uncompressed animation".into()))?;
-        return serde_json::from_slice(&anim.1).map_err(|e| LottieError::Parse(e.to_string()));
+        return serde_json::from_slice(anim.1).map_err(|e| LottieError::Parse(e.to_string()));
     }
     serde_json::from_slice(bytes).map_err(|e| LottieError::Parse(e.to_string()))
 }

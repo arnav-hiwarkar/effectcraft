@@ -686,6 +686,74 @@ fn dotlottie_archive_roundtrip() {
     assert_eq!(q.comp(imp.comp).unwrap().layers.len(), 1);
 }
 
+#[test]
+fn dotlottie_stored_selection_and_errors() {
+    let preferred = br#"{"nm":"Preferred","w":17,"h":19,"fr":30,"ip":0,"op":30,"layers":[]}"#;
+    let fallback = br#"{"nm":"Fallback","w":23,"h":29,"fr":30,"ip":0,"op":30,"layers":[]}"#;
+    let archive = |entries: &[(&str, &[u8])]| crate::zip::store(&entries.iter().map(|(n, b)| (n.to_string(), b.to_vec())).collect::<Vec<_>>());
+    let compressed = |mut bytes: Vec<u8>| {
+        bytes[8..10].copy_from_slice(&8u16.to_le_bytes());
+        bytes
+    };
+    let mut cases = vec![
+        (archive(&[("fallback.json", fallback), ("images/unused.bin", b"\xffinvalid"), ("animations/main.json", preferred)]), Some(("Preferred", 17, 19))),
+        (archive(&[("animations/first.json", preferred), ("animations/second.json", fallback)]), Some(("Preferred", 17, 19))),
+        (archive(&[("manifest.json", b"{}"), ("fallback.json", fallback), ("second.json", preferred)]), Some(("Fallback", 23, 29))),
+        (archive(&[("animations/../unsafe.json", preferred), ("fallback.json", fallback)]), Some(("Fallback", 23, 29))),
+        (compressed(archive(&[("animations/main.json", preferred), ("fallback.json", fallback)])), Some(("Fallback", 23, 29))),
+        (archive(&[("manifest.json", b"{}")]), None),
+        (compressed(archive(&[("animations/main.json", preferred)])), None),
+    ];
+    let name = "animations/main.json";
+    let mut extra = archive(&[(name, preferred)]);
+    let extra_start = 30 + name.len();
+    extra[28..30].copy_from_slice(&4u16.to_le_bytes());
+    extra.splice(extra_start..extra_start, [0u8; 4]);
+    cases.push((extra.clone(), Some(("Preferred", 17, 19))));
+    for cut in [2, 20, 31, extra_start - 1, extra_start + 2, extra_start + 4 + 1, extra_start + 4 + preferred.len() - 1] {
+        cases.push((extra[..cut].to_vec(), None));
+    }
+    let mut prefix = archive(&[("fallback.json", fallback)]);
+    prefix.truncate(30 + "fallback.json".len() + fallback.len());
+    prefix.extend_from_slice(&extra[..extra_start + 5]);
+    cases.push((prefix, Some(("Fallback", 23, 29))));
+    for (bytes, expected) in cases {
+        let mut project = Project::default();
+        let result = import(&mut project, &bytes, "x", "", &mut |_| None);
+        if let Some((name, width, height)) = expected {
+            let result = result.unwrap();
+            assert_eq!(project.item(result.comp).unwrap().name, name);
+            let composition = project.comp(result.comp).unwrap();
+            assert_eq!((composition.width, composition.height, composition.layers.len()), (width, height, 0));
+            assert!(result.warnings.is_empty());
+        } else {
+            let crate::LottieError::Parse(message) = result.unwrap_err() else { panic!("expected parse error") };
+            assert_eq!(message, "dotLottie archive without an uncompressed animation");
+            assert!(project.items.is_empty());
+        }
+    }
+    for entries in [
+        vec![("animations/bad.json", b"invalid".as_slice()), ("animations/good.json", preferred.as_slice()), ("fallback.json", fallback.as_slice())],
+        vec![("bad.json", b"invalid".as_slice()), ("good.json", fallback.as_slice())],
+    ] {
+        let mut project = Project::default();
+        assert!(matches!(import(&mut project, &archive(&entries), "x", "", &mut |_| None), Err(crate::LottieError::Parse(_))));
+        assert!(project.items.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "isolated perf94 RSS measurement; requires PERF94_ARCHIVE"]
+fn perf94_archive_import_rss() {
+    let bytes = std::fs::read(std::env::var_os("PERF94_ARCHIVE").expect("PERF94_ARCHIVE fixture path")).unwrap();
+    let mut project = Project::default();
+    let result = import(&mut project, &bytes, "x", "", &mut |_| None).unwrap();
+    let composition = project.comp(result.comp).unwrap();
+    let actual = (project.item(result.comp).unwrap().name.as_str(), composition.width, composition.height, composition.layers.len(), result.warnings);
+    assert_eq!(actual, ("Preferred", 17, 19, 0, vec![]));
+    println!("{actual:?}");
+}
+
 // ---------------------------------------------------------------- hand-written fixtures
 
 fn fixture(name: &str) -> (Project, ItemId, Vec<String>) {
