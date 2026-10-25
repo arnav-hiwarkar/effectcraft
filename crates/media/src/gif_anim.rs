@@ -23,7 +23,7 @@ pub(crate) const MAX_BYTES: usize = 1 << 30;
 #[cfg(target_arch = "wasm32")]
 pub(crate) const MAX_BYTES: usize = 256 << 20;
 
-/// Frames read from a GIF's or animated WebP's headers when probing.
+/// Maximum frames probed or retained when decoding a GIF or animated WebP.
 pub(crate) const MAX_FRAMES: usize = 100_000;
 
 /// Whether `f` is an animated GIF or WebP imported by [`probe`] or [`crate::webp_anim::probe`]:
@@ -105,6 +105,9 @@ impl Anim {
                     break;
                 }
             };
+            if frames.len() >= MAX_FRAMES {
+                return Err(MediaError::Unsupported(format!("GIF exceeds the {MAX_FRAMES}-frame limit")));
+            }
             let (numer, denom) = frame.delay().numer_denom_ms();
             let cs = delay_cs(numer.checked_div(denom).unwrap_or(0) / 10);
             let buf = frame.into_buffer();
@@ -156,6 +159,54 @@ mod tests {
         let img = pool.frame_at(f, Tick::from_seconds_f64(seconds)).unwrap();
         let p = img.data[0];
         [p[0], p[1], p[2]]
+    }
+
+    fn repeated_gif(red_frames: usize) -> Vec<u8> {
+        let encode = |index| {
+            let mut out = Vec::new();
+            {
+                let mut enc = gif::Encoder::new(&mut out, 1, 1, &[255, 0, 0, 0, 255, 0]).unwrap();
+                let frame = gif::Frame { width: 1, height: 1, delay: 2, buffer: std::borrow::Cow::Owned(vec![index]), ..Default::default() };
+                enc.write_frame(&frame).unwrap();
+            }
+            assert_eq!(out[10] & 0x87, 0x80);
+            assert_eq!(&out[13..19], &[255, 0, 0, 0, 255, 0]);
+            assert_eq!(&out[19..22], &[0x21, 0xf9, 4]);
+            assert_eq!(out.last(), Some(&0x3b));
+            out
+        };
+        let red = encode(0);
+        let green = encode(1);
+        assert_eq!(&red[..19], &green[..19]);
+        let mut out = red[..19].to_vec();
+        for _ in 0..red_frames {
+            out.extend_from_slice(&red[19..red.len() - 1]);
+        }
+        out.extend_from_slice(&green[19..green.len() - 1]);
+        out.push(0x3b);
+        out
+    }
+
+    #[test]
+    fn frame_limit_accepts_boundary_and_rejects_extra_frame() {
+        let bytes = repeated_gif(super::MAX_FRAMES - 1);
+        let footage = super::probe("limit.gif", &bytes).unwrap();
+        assert_eq!(footage.kind, FootageKind::Video);
+        assert_eq!(footage.duration, Tick::from_units(2_000_000, 1000));
+        let anim = super::Anim::load(&bytes).unwrap();
+        assert_eq!(anim.frames.len(), 100_000);
+        assert_eq!(anim.starts.len(), 100_000);
+        for (ms, rgba) in [(1_999_960, [255, 0, 0, 255]), (1_999_980, [0, 255, 0, 255]), (2_000_020, [0, 255, 0, 255])] {
+            assert_eq!(anim.frame_at(Tick::from_units(ms, 1000)).unwrap().to_rgba8().get_pixel(0, 0).0, rgba);
+        }
+        drop(anim);
+
+        let bytes = repeated_gif(super::MAX_FRAMES);
+        match super::Anim::load(&bytes) {
+            Err(crate::MediaError::Unsupported(message)) => assert_eq!(message, "GIF exceeds the 100000-frame limit"),
+            Err(error) => panic!("unexpected error: {error}"),
+            Ok(_) => panic!("GIF with 100001 frames was accepted"),
+        }
     }
 
     #[test]
