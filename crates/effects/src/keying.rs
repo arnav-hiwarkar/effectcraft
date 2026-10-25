@@ -205,9 +205,9 @@ fn color_difference_key(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let pb = lv("partialB");
     let (mb, mw, mg) = (pr.f("blackLevel") as f32, pr.f("whiteLevel") as f32, pr.f("gamma") as f32);
     let (w, h) = (b.img.width as usize, b.img.height as usize);
-    let src = b.img.clone();
     b.img.data.par_iter_mut().enumerate().for_each(|(i, px)| {
-        let (c, a0) = unpremul(src.data[i]);
+        let in_px = *px;
+        let (c, a0) = unpremul(in_px);
         let c = lin(c);
         let ua = 1.0 - ((c[pi] - c[o1]) / kd1).clamp(0.0, 1.0);
         let ub = 1.0 - ((c[pi] - c[o2]) / kd2).clamp(0.0, 1.0);
@@ -238,7 +238,7 @@ fn color_difference_key(ctx: &EffectCtx, mut b: Buf) -> Buf {
             4 => grey(cb),
             5 => grey(um),
             6 => grey(cm),
-            _ => src.data[i].map(|v| v * cm),
+            _ => in_px.map(|v| v * cm),
         };
     });
     b
@@ -932,5 +932,39 @@ mod tests {
         let cc = ultra(&[("ultraSettings/spillColorCorrection", num(100.0))], g);
         let sum = |p: [f32; 4]| p[0] + p[1] + p[2];
         assert!(sum(cc) > sum(plain) + 0.1 && (sum(cc) - sum(g)).abs() < 1e-4, "{plain:?} {cc:?}");
+    }
+
+    #[test]
+    fn color_difference_key_in_place_all_views() {
+        let base_img = green_screen();
+        // View 0: pass through unmodified.
+        let v0 = run("ec.key.colordifference", &[("keyColor", green()), ("view", Value::Enum(0))], base_img.clone());
+        assert_eq!(v0.data, base_img.data);
+
+        // View 7 / default: final output keyed in place.
+        let final_out = run("ec.key.colordifference", &[("keyColor", green()), ("view", Value::Enum(7))], base_img.clone());
+        // Green background is removed (alpha ~ 0), red foreground is preserved unmutated.
+        assert!(final_out.get(2, 2)[3] < 0.01);
+        assert_eq!(final_out.get(12, 2), base_img.get(12, 2));
+
+        // Matte views 1..=6 produce opaque greyscale mattes. The red foreground is white in Partial A and
+        // the combined matte, and 1 - (0.2 - 0.1) / (0.8 - 0.15) in Partial B.
+        let partial_b: f32 = 1.0 - (0.2 - 0.1) / (0.8 - 0.15);
+        for (mode, red) in [(1, 1.0), (2, 1.0), (3, partial_b), (4, partial_b), (5, 1.0), (6, 1.0)] {
+            let out = run("ec.key.colordifference", &[("keyColor", green()), ("view", Value::Enum(mode))], base_img.clone());
+            assert!(out.data.iter().all(|p| (p[3] - 1.0).abs() < 1e-6));
+            // Green screen should produce near-black matte.
+            assert!(out.get(2, 2)[0] < 0.05);
+            assert!((out.get(12, 2)[0] - red).abs() < 1e-4, "view {mode}: {:?}", out.get(12, 2));
+        }
+
+        // View 8: four-up quadrant mode.
+        let four_up = run("ec.key.colordifference", &[("keyColor", green()), ("view", Value::Enum(8))], base_img.clone());
+        // Top-left (view 2), top-right (view 4), bottom-left (view 6) are opaque mattes.
+        assert_eq!(four_up.get(2, 2)[3], 1.0);
+        assert_eq!(four_up.get(12, 2)[3], 1.0);
+        assert_eq!(four_up.get(2, 6)[3], 1.0);
+        // Bottom-right (view 7, final output) preserves foreground unkeyed pixel.
+        assert_eq!(four_up.get(12, 6), base_img.get(12, 6));
     }
 }
