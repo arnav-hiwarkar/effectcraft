@@ -581,11 +581,15 @@ pub fn bubble_list(ctx: &EffectCtx, b: &Buf) -> Vec<Bubble> {
 }
 
 fn bubbles(ctx: &EffectCtx, mut b: Buf) -> Buf {
+    let list = bubble_list(ctx, &b);
+    if list.is_empty() {
+        b.img.data.fill([0.0; 4]);
+        return b;
+    }
     let pr = ctx.params;
     let metal = pr.e("reflectionType") == 1;
     let shading = pr.e("shadingType");
-    let list = bubble_list(ctx, &b);
-    let src = b.img.clone();
+    let src = std::mem::take(&mut b.img);
     let mut out = Image::new(src.width, src.height);
     raster(
         &mut out,
@@ -1350,8 +1354,12 @@ pub fn mercury_blobs(ctx: &EffectCtx, b: &Buf) -> Vec<Blob> {
 }
 
 fn mr_mercury(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let pr = ctx.params;
     let blobs = mercury_blobs(ctx, &b);
+    if blobs.is_empty() {
+        b.img.data.fill([0.0; 4]);
+        return b;
+    }
+    let pr = ctx.params;
     let influence = pr.f("blobInfluence") as f32 / 100.0;
     let s = b.scale as f32;
     let (w, hh) = (b.img.width, b.img.height);
@@ -1390,7 +1398,7 @@ fn mr_mercury(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let ldir = (pr.f("light/lightDirection") as f32).to_radians();
     let lheight = pr.f("light/lightHeight") as f32 / 100.0;
     let l = norm3([ldir.sin(), -ldir.cos(), lheight.max(0.05)]);
-    let src = b.img.clone();
+    let src = std::mem::take(&mut b.img);
     let mut out = Image::new(w, hh);
     out.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
@@ -1722,6 +1730,21 @@ mod tests {
     }
 
     #[test]
+    fn bubbles_empty_and_take() {
+        let input = ramp(40, 40);
+        let empty = run("ec.sim.ccbubbles", &[("bubbleAmount", num(0.0))], input.clone(), 0.3);
+        assert_eq!(empty.width, 40);
+        assert_eq!(empty.height, 40);
+        assert!(empty.data.iter().all(|p| *p == [0.0; 4]));
+
+        let vals = [("bubbleAmount", num(30.0)), ("bubbleSize", num(3.0))];
+        let a = run("ec.sim.ccbubbles", &vals, input.clone(), 0.3);
+        let b = run("ec.sim.ccbubbles", &vals, input, 0.3);
+        assert_eq!(a, b);
+        assert!(a.data.iter().any(|p| p[3] > 0.5));
+    }
+
+    #[test]
     fn drizzle_ripples() {
         let a = run("ec.sim.ccdrizzle", &[], ramp(48, 48), 0.6);
         assert_eq!(a, run("ec.sim.ccdrizzle", &[], ramp(48, 48), 0.6));
@@ -2015,6 +2038,21 @@ mod tests {
         assert!(a.data.iter().any(|p| p[3] > 0.5), "blobs visible");
         let none = run("ec.sim.ccmrmercury", &[("birthRate", num(0.0))], ramp(48, 48), 1.4);
         assert!(none.data.iter().all(|p| p[3] == 0.0));
+    }
+
+    #[test]
+    fn mr_mercury_empty_and_take() {
+        let input = ramp(48, 48);
+        let empty = run("ec.sim.ccmrmercury", &[("birthRate", num(0.0))], input.clone(), 1.4);
+        assert_eq!(empty.width, 48);
+        assert_eq!(empty.height, 48);
+        assert!(empty.data.iter().all(|p| *p == [0.0; 4]));
+
+        let v = vec![("producer", pt(24.0, 16.0)), ("radiusX", num(5.0)), ("radiusY", num(5.0)), ("birthRate", num(3.0))];
+        let a = run("ec.sim.ccmrmercury", &v, input.clone(), 1.4);
+        let b = run("ec.sim.ccmrmercury", &v, input, 1.4);
+        assert_eq!(a, b);
+        assert!(a.data.iter().any(|p| p[3] > 0.5));
     }
 
     #[test]
