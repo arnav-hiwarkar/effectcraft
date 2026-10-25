@@ -14,7 +14,7 @@
 //!   are deleted.
 //! * Size limit with least-recently-used eviction. The in-memory index is rebuilt from the
 //!   folder when the cache opens (file modification times order it), so the cache survives
-//!   restarts; reads refresh a file's time.
+//!   restarts; reads refresh a file's time, at most once a minute per entry.
 //! * Safe concurrent access: writes go to a unique temporary file that is renamed into place
 //!   (atomic on every desktop OS), so readers in this or another process never see a partial
 //!   entry; a missing or damaged file is just a miss. Writes run on a background thread with a
@@ -85,7 +85,13 @@ pub struct DiskStats {
 struct Meta {
     bytes: u64,
     last_use: u64,
+    /// Last time the entry's recency was persisted to disk, on the caller's millisecond clock;
+    /// `None` = never persisted (`insert` doesn't mark one), so the next hit persists.
+    persisted_ms: Option<u64>,
 }
+
+/// Persist an entry's recency to disk at most once per this many milliseconds per hit.
+const RECENCY_PERSIST_MS: u64 = 60_000;
 
 /// The cache's index: entry sizes and least-recently-used order under a size limit. Portable
 /// (no file system): [`DiskCache`] keeps one over its folder, and the browser keeps one over the
@@ -102,7 +108,7 @@ impl DiskIndex {
     pub fn insert(&mut self, kind: Kind, key: u128, bytes: u64) {
         self.clock += 1;
         let c = self.clock;
-        if let Some(old) = self.map.insert((kind, key), Meta { bytes, last_use: c }) {
+        if let Some(old) = self.map.insert((kind, key), Meta { bytes, last_use: c, persisted_ms: None }) {
             self.total -= old.bytes;
         }
         self.total += bytes;
@@ -110,15 +116,26 @@ impl DiskIndex {
 
     /// Mark an entry as just used (a read). `false` when it is not indexed.
     pub fn touch(&mut self, kind: Kind, key: u128) -> bool {
+        let Some(m) = self.map.get_mut(&(kind, key)) else { return false };
         self.clock += 1;
-        let c = self.clock;
-        match self.map.get_mut(&(kind, key)) {
-            Some(m) => {
-                m.last_use = c;
-                true
-            }
-            None => false,
+        m.last_use = self.clock;
+        true
+    }
+
+    /// Mark an entry as just used and report whether its recency should be persisted to disk
+    /// (`Some(true)`, the entry's first hit since it was written or once per entry per
+    /// [`RECENCY_PERSIST_MS`] after that), `Some(false)` when nothing is due, `None` when it is
+    /// not indexed. `now_ms` is on the caller's clock: it never needs to be serialised, so the
+    /// index stays portable.
+    pub fn touch_at(&mut self, kind: Kind, key: u128, now_ms: u64) -> Option<bool> {
+        let m = self.map.get_mut(&(kind, key))?;
+        self.clock += 1;
+        m.last_use = self.clock;
+        let due = m.persisted_ms.is_none_or(|p| now_ms.saturating_sub(p) >= RECENCY_PERSIST_MS);
+        if due {
+            m.persisted_ms = Some(now_ms);
         }
+        Some(due)
     }
 
     /// Forget an entry; its size, if it was indexed.
@@ -234,6 +251,8 @@ pub struct DiskCache {
     queue: Arc<(Mutex<Queue>, Condvar)>,
     /// Layer buffers that took less than this to render are not written (ms).
     min_layer_ms: AtomicU64,
+    /// This cache's clock zero (recency persistence is measured from process start, ms).
+    started: std::time::Instant,
 }
 
 /// FNV-1a 128-bit (content keys).
@@ -306,6 +325,7 @@ impl DiskCache {
             tmp_counter: AtomicU64::new(0),
             queue: Arc::new((Mutex::new(Queue { jobs: Default::default(), busy: false }), Condvar::new())),
             min_layer_ms: AtomicU64::new(30),
+            started: std::time::Instant::now(),
         });
         dc.rescan();
         dc.evict();
@@ -442,11 +462,13 @@ impl DiskCache {
             Some(payload) => {
                 let payload = payload.to_vec();
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                if let Ok(mut g) = self.index.lock() {
-                    g.touch(kind, key);
-                }
-                // Persist the recency for the next session (best effort).
-                if let Ok(f) = std::fs::File::options().append(true).open(&path) {
+                // Persist the recency for the next session, at most once per entry per minute
+                // (best effort): at 30 hits/s a cached frame is not rewritten 30 times/s.
+                let now_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if let Ok(mut g) = self.index.lock()
+                    && g.touch_at(kind, key, now_ms) == Some(true)
+                    && let Ok(f) = std::fs::File::options().append(true).open(&path)
+                {
                     let _ = f.set_modified(std::time::SystemTime::now());
                 }
                 Some(payload)
@@ -932,6 +954,68 @@ mod tests {
         assert_eq!(ix.keys(Kind::Frame), vec![1]);
         ix.clear();
         assert!(ix.is_empty() && ix.total() == 0);
+    }
+
+    /// Recency is persisted to disk at most once per entry per 60 s window (a cached frame
+    /// played back at 30/s must not open + rewrite the file 30 times a second). A never
+    /// persisted entry (`insert` never marks one, so rescanned entries after a restart too) is
+    /// due on its first hit, at any point on the caller's clock.
+    #[test]
+    fn touch_at_persists_once_per_window() {
+        let mut ix = DiskIndex::default();
+        ix.insert(Kind::Frame, 1, 100);
+        // First hit: always due, even at time zero.
+        assert_eq!(ix.touch_at(Kind::Frame, 1, 0), Some(true));
+        // 50 further hits within the 60 s window are all not due and change nothing.
+        for i in 1..=50u64 {
+            assert_eq!(ix.touch_at(Kind::Frame, 1, i * 1_000), Some(false));
+        }
+        // Past the window (60 s after the last persist) the recency is persisted again.
+        assert_eq!(ix.touch_at(Kind::Frame, 1, 60_000), Some(true));
+        assert_eq!(ix.touch_at(Kind::Frame, 1, 60_001), Some(false));
+        // Plain `touch` never asks for a persist (and does not shift the window).
+        assert!(ix.touch(Kind::Frame, 1));
+        assert_eq!(ix.touch_at(Kind::Frame, 1, 0), Some(false));
+        // A fresh entry's first hit is also due at a nonzero time.
+        ix.insert(Kind::Frame, 2, 100);
+        assert_eq!(ix.touch_at(Kind::Frame, 2, 1_000), Some(true));
+    }
+
+    /// A missing or removed entry reports `None` instead of panicking, and `touch_at` still
+    /// updates the recency order (eviction picks the untouched entry) like `touch` does.
+    #[test]
+    fn touch_at_missing_entry_is_none() {
+        let mut ix = DiskIndex::default();
+        assert_eq!(ix.touch_at(Kind::Frame, 1, 1_000), None);
+        ix.insert(Kind::Frame, 1, 100);
+        ix.insert(Kind::Frame, 2, 100);
+        assert_eq!(ix.touch_at(Kind::Layer, 1, 2_000), None);
+        assert_eq!(ix.remove(Kind::Frame, 1), Some(100));
+        assert_eq!(ix.touch_at(Kind::Frame, 1, 3_000), None);
+        ix.touch_at(Kind::Frame, 2, 4_000);
+        assert_eq!(ix.lru_order(), vec![(Kind::Frame, 2)]);
+        ix.insert(Kind::Frame, 1, 100);
+        ix.touch_at(Kind::Frame, 1, 5_000);
+        assert_eq!(ix.lru_order(), vec![(Kind::Frame, 2), (Kind::Frame, 1)]);
+    }
+
+    /// Hits inside the persist window never rewrite the cached file's modification time. The
+    /// warm-up hit is the one persist (a fresh entry is never marked as persisted); the next 60 s
+    /// of hits are pure reads.
+    #[test]
+    fn hits_within_the_window_keep_the_file_mtime() {
+        let dir = tmpdir("mtime");
+        let dc = DiskCache::open(&dir, 1 << 30).unwrap();
+        dc.put_frame_now(9, 8, 8, &[3; 256]);
+        let p = dc.path(Kind::Frame, 9);
+        assert_eq!(dc.get_frame(9).unwrap().rgba, vec![3; 256]);
+        let written = std::fs::metadata(&p).and_then(|m| m.modified()).unwrap();
+        for _ in 0..100 {
+            assert_eq!(dc.get_frame(9).unwrap().rgba, vec![3; 256]);
+        }
+        let on_disk = std::fs::metadata(&p).and_then(|m| m.modified()).unwrap();
+        assert_eq!(written, on_disk, "hits within the window must not write the file");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
