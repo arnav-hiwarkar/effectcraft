@@ -43,6 +43,9 @@ const UPLOAD_BUDGET: usize = 1536 << 20;
 /// Working textures kept for reuse once their last image is dropped (bytes).
 const POOL_BUDGET: usize = 768 << 20;
 
+/// Working textures waiting for the encoder that released them (`Pool::released`, bytes).
+const RELEASED_BUDGET: usize = 512 << 20;
+
 /// Readback staging buffers kept for reuse across sizes (bytes).
 const STAGING_BUDGET: u64 = 256 << 20;
 
@@ -103,6 +106,8 @@ pub(crate) struct Pool {
     free: HashMap<(u32, u32), Vec<wgpu::Texture>>,
     /// (texture, newest encoder open at its release).
     released: Vec<(wgpu::Texture, u64)>,
+    /// Sum of `tex_bytes` over `released` (kept exact by [`Pool::hold`] and [`Pool::close`]).
+    released_bytes: usize,
     /// Encoders with recorded, unsubmitted work.
     open: BTreeSet<u64>,
     next: u64,
@@ -224,8 +229,21 @@ fn tex_bytes(t: &wgpu::Texture) -> usize {
 impl Pool {
     fn release(&mut self, t: wgpu::Texture) {
         match self.open.last() {
-            Some(&newest) => self.released.push((t, newest)),
+            Some(&newest) => self.hold(t, newest),
             None => self.make_free(t),
+        }
+    }
+
+    /// A texture released while an encoder is open: wait under [`RELEASED_BUDGET`], oldest
+    /// dropped first (the newest is kept, so a single texture above the cap is not dropped at
+    /// once). Dropping a still-referenced texture is safe: wgpu frees it only after every
+    /// recorded command that uses it has run.
+    fn hold(&mut self, t: wgpu::Texture, newest: u64) {
+        self.released_bytes = self.released_bytes.saturating_add(tex_bytes(&t));
+        self.released.push((t, newest));
+        while self.released_bytes > RELEASED_BUDGET && self.released.len() > 1 {
+            let dropped = self.released.remove(0);
+            self.released_bytes = self.released_bytes.saturating_sub(tex_bytes(&dropped.0));
         }
     }
 
@@ -256,6 +274,7 @@ impl Pool {
         for (t, _) in ready {
             self.make_free(t);
         }
+        self.released_bytes = self.released.iter().map(|(t, _)| tex_bytes(t)).fold(0, usize::saturating_add);
     }
 
     fn register(&mut self) -> u64 {
@@ -1554,5 +1573,106 @@ mod adapter_name_tests {
     fn no_adapters_has_its_own_message() {
         let e = match_adapter_name("x", &[]).unwrap_err();
         assert!(e.contains("no adapters on the enabled backends"), "{e}");
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod released_cap_tests {
+    use super::{GpuContext, Pool, RELEASED_BUDGET, tex_bytes};
+    use crate::tests::hold_gpu_lock;
+
+    /// A 2048 x 2048 texture is 64 MB (`tex_bytes`), so the cap holds 8 of them.
+    const TEX_BYTES: usize = 64 << 20;
+    const TEX_W: u32 = 2048;
+    const TEX_H: u32 = 2048;
+
+    /// A pool that has released `n` textures of [`TEX_BYTES`] while one encoder is open.
+    fn pooled(gpu: &GpuContext, n: usize) -> (Pool, u64) {
+        let mut p = Pool::default();
+        let e = p.open();
+        for _ in 0..n {
+            p.release(gpu.texture(TEX_W, TEX_H));
+        }
+        (p, e)
+    }
+
+    /// [`GpuContext::headless`], or none (the test skips) when no adapter qualifies.
+    fn gpu() -> Option<GpuContext> {
+        hold_gpu_lock();
+        GpuContext::headless()
+    }
+
+    #[test]
+    fn released_bytes_capped_while_encoder_open() {
+        let Some(gpu) = gpu() else {
+            return;
+        };
+        let (p, e) = pooled(&gpu, 12);
+        let held: usize = p.released.iter().map(|(t, _)| tex_bytes(t)).sum();
+        assert_eq!(p.released.len(), 8, "12 x {TEX_BYTES} exceed the {RELEASED_BUDGET} cap");
+        assert!(p.released_bytes <= RELEASED_BUDGET, "cap exceeded: {} > {RELEASED_BUDGET}", p.released_bytes);
+        assert_eq!(p.released_bytes, 8 * TEX_BYTES, "the newest textures fill the cap");
+        assert_eq!(held, p.released_bytes, "released_bytes tracks the held textures");
+        assert!(p.released.iter().all(|(_, w)| *w == e), "held textures wait on the open encoder");
+    }
+
+    #[test]
+    fn close_empties_released_and_zeroes_bytes() {
+        let Some(gpu) = gpu() else {
+            return;
+        };
+        let (mut p, e) = pooled(&gpu, 12);
+        p.close(e);
+        assert!(p.open.is_empty() && p.released.is_empty(), "close drains the waited-for list");
+        assert_eq!(p.released_bytes, 0, "close recomputes the waited-for bytes");
+        assert_eq!(p.bytes, 8 * TEX_BYTES, "the drained textures land in the free list");
+        assert_eq!(p.free.get(&(TEX_W, TEX_H)).map_or(0, |v| v.len()), 8);
+    }
+
+    #[test]
+    fn single_texture_over_cap_is_kept() {
+        let Some(gpu) = gpu() else {
+            return;
+        };
+        if !gpu.fits(8192, 8192) {
+            eprintln!("released_cap_tests: the device cannot make the over-cap 8192 x 8192 texture, skipping");
+            return;
+        }
+        let mut p = Pool::default();
+        let e = p.open();
+        let over = gpu.texture(8192, 8192);
+        let over_bytes = tex_bytes(&over);
+        assert!(over_bytes > RELEASED_BUDGET, "the test texture must exceed the cap");
+        p.release(over);
+        assert_eq!(p.released.len(), 1, "the only waited-for texture is never dropped at once");
+        assert_eq!(p.released_bytes, over_bytes);
+        p.release(gpu.texture(TEX_W, TEX_H));
+        assert_eq!(p.released.len(), 1, "the cap is met by dropping the oldest, not the newest");
+        assert_eq!(p.released_bytes, TEX_BYTES, "the newest texture is the one kept");
+        assert!(p.released.iter().all(|(_, w)| *w == e));
+    }
+
+    /// `close` drains only the textures whose encoder is gone: the ones still waiting for a
+    /// newer encoder keep their bytes.
+    #[test]
+    fn close_keeps_bytes_of_still_waiting_textures() {
+        let Some(gpu) = gpu() else {
+            return;
+        };
+        let mut p = Pool::default();
+        let e1 = p.open();
+        p.release(gpu.texture(TEX_W, TEX_H)); // waits for e1, the only open encoder
+        let e2 = p.open();
+        p.release(gpu.texture(TEX_W, TEX_H)); // waits for e2, the newest open encoder
+        p.release(gpu.texture(TEX_W, TEX_H));
+        assert_eq!(p.released.len(), 3);
+        assert_eq!(p.released_bytes, 3 * TEX_BYTES);
+        p.close(e1);
+        assert_eq!(p.released.len(), 2, "the textures waiting for e2 stay");
+        assert_eq!(p.released_bytes, 2 * TEX_BYTES, "close keeps the bytes of the waiting textures");
+        assert_eq!(p.free.get(&(TEX_W, TEX_H)).map_or(0, |v| v.len()), 1, "the drained texture lands in the free list");
+        p.close(e2);
+        assert!(p.released.is_empty() && p.released_bytes == 0, "the last close empties the list");
+        assert_eq!(p.free.get(&(TEX_W, TEX_H)).map_or(0, |v| v.len()), 3);
     }
 }
