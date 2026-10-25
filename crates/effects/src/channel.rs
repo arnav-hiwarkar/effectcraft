@@ -37,10 +37,10 @@ fn set_channels(ctx: &EffectCtx, mut b: Buf) -> Buf {
         route(&mut b, s);
         return b;
     }
-    let own = b.img.clone();
     b.img.data.par_iter_mut().enumerate().for_each(|(i, px)| {
+        let orig = *px;
         let v: [f32; 4] = std::array::from_fn(|k| {
-            let q = layers[k].as_ref().map(|l| l.data[i]).unwrap_or(own.data[i]);
+            let q = layers[k].as_ref().and_then(|l| l.data.get(i).copied()).unwrap_or(orig);
             let (c, a) = unpremul(q);
             pick(s[k], c, a)
         });
@@ -632,16 +632,31 @@ mod tests {
         }
     }
 
-    fn run_host(id: &str, over: &[(&str, Value)], img: Image, other: Image) -> Image {
+    struct MultiHost(Vec<(u64, Image)>);
+    impl crate::EffectHost for MultiHost {
+        fn layer(&self, id: u64, _: bool) -> Option<crate::LayerPixels> {
+            let img = self.0.iter().find(|(k, _)| *k == id).map(|(_, img)| img)?;
+            let (w, h) = (img.width as f64, img.height as f64);
+            Some(crate::LayerPixels { buf: Buf { img: img.clone(), offset: [0.0; 2], scale: 1.0 }, size: [w, h] })
+        }
+        fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+            None
+        }
+    }
+
+    fn run_host_dyn(id: &str, over: &[(&str, Value)], img: Image, host: &dyn crate::EffectHost) -> Image {
         let s = find(id).unwrap();
         let mut params = Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
         for (k, v) in over {
             params.values.insert(k.to_string(), v.clone());
         }
-        let host = OneLayer(other);
-        let env = crate::EffectEnv { host: Some(&host), ..Default::default() };
+        let env = crate::EffectEnv { host: Some(host), ..Default::default() };
         let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [img.width as f64, img.height as f64], seed: 1, adjustment: true, env };
         apply(s, &ctx, Buf { img, offset: [0.0, 0.0], scale: 1.0 }).img
+    }
+
+    fn run_host(id: &str, over: &[(&str, Value)], img: Image, other: Image) -> Image {
+        run_host_dyn(id, over, img, &OneLayer(other))
     }
 
     #[test]
@@ -650,6 +665,37 @@ mod tests {
         let out = run_host("ec.channel.setchannels", &[("sourceLayer2", Value::Layer(Some(9)))], sample(), other);
         // Green from the other layer's green; red, blue, alpha from the layer itself.
         assert!(close(out.get(0, 0), [0.2, 0.1, 0.9, 1.0]), "{:?}", out.get(0, 0));
+    }
+
+    #[test]
+    fn set_channels_in_place_partial_layers_preserves_unreferenced_channels() {
+        let base = sample();
+        let l1 = Image::filled(8, 8, [0.8, 0.0, 0.0, 1.0]);
+        let l3 = Image::filled(8, 8, [0.0, 0.0, 0.4, 1.0]);
+        let host = MultiHost(vec![(1, l1), (3, l3)]);
+        let over = [("sourceLayer1", Value::Layer(Some(1))), ("sourceLayer3", Value::Layer(Some(3)))];
+        let out = run_host_dyn("ec.channel.setchannels", &over, base.clone(), &host);
+        assert!(close(out.get(0, 0), [0.8, 0.5, 0.4, 1.0]), "{:?}", out.get(0, 0));
+        assert!(close(out.get(7, 0), [0.4, 0.25, 0.2, 0.5]), "{:?}", out.get(7, 0));
+    }
+
+    #[test]
+    fn set_channels_all_layers_in_place() {
+        let l1 = Image::filled(4, 4, [0.3, 0.0, 0.0, 1.0]);
+        let l2 = Image::filled(4, 4, [0.0, 0.6, 0.0, 1.0]);
+        let l3 = Image::filled(4, 4, [0.0, 0.0, 0.8, 1.0]);
+        let l4 = Image::filled(4, 4, [0.0, 0.0, 0.0, 0.5]);
+        let host = MultiHost(vec![(1, l1), (2, l2), (3, l3), (4, l4)]);
+        let base = Image::filled(4, 4, [1.0, 1.0, 1.0, 1.0]);
+        let over = [
+            ("sourceLayer1", Value::Layer(Some(1))),
+            ("sourceLayer2", Value::Layer(Some(2))),
+            ("sourceLayer3", Value::Layer(Some(3))),
+            ("sourceLayer4", Value::Layer(Some(4))),
+        ];
+        let out = run_host_dyn("ec.channel.setchannels", &over, base, &host);
+        assert!(close(out.get(0, 0), [0.15, 0.3, 0.4, 0.5]), "{:?}", out.get(0, 0));
+        assert!(close(out.get(3, 3), [0.15, 0.3, 0.4, 0.5]), "{:?}", out.get(3, 3));
     }
 
     #[test]
