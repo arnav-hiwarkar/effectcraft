@@ -949,6 +949,43 @@ mod tests {
     }
 
     #[test]
+    fn mosaic_zero_dimension_and_large_tiles_do_not_panic_or_corrupt() {
+        // 1. Zero-dimension image evaluates cleanly without panic or allocation.
+        let empty = Image::new(0, 0);
+        let out_empty_avg = run_at("ec.stylize.mosaic", &[("horizontal", num(5.0)), ("vertical", num(5.0))], empty.clone(), 0.0);
+        assert_eq!((out_empty_avg.img.width, out_empty_avg.img.height), (0, 0));
+        let out_empty_sharp = run_at("ec.stylize.mosaic", &[("horizontal", num(5.0)), ("vertical", num(5.0)), ("sharpColors", Value::Bool(true))], empty, 0.0);
+        assert_eq!((out_empty_sharp.img.width, out_empty_sharp.img.height), (0, 0));
+
+        // 2. Extreme block counts on a small image evaluate correctly without out-of-bounds indexing.
+        let small = ramp(10, 10);
+        let out_large_avg = run_at("ec.stylize.mosaic", &[("horizontal", num(1000.0)), ("vertical", num(1000.0))], small.clone(), 0.0);
+        assert_eq!((out_large_avg.img.width, out_large_avg.img.height), (10, 10));
+        let out_large_sharp =
+            run_at("ec.stylize.mosaic", &[("horizontal", num(1000.0)), ("vertical", num(1000.0)), ("sharpColors", Value::Bool(true))], small.clone(), 0.0);
+        assert_eq!((out_large_sharp.img.width, out_large_sharp.img.height), (10, 10));
+        for y in 0..10 {
+            for x in 0..10 {
+                assert_eq!(out_large_avg.img.get(x, y), small.get(x, y));
+                assert_eq!(out_large_sharp.img.get(x, y), small.get(x, y));
+            }
+        }
+
+        // 3. Both average mode and sharpColors mode evaluate bit-identically to expected tile averages and center samples.
+        let img = ramp(20, 10);
+        let avg = run_at("ec.stylize.mosaic", &[("horizontal", num(2.0)), ("vertical", num(1.0))], img.clone(), 0.0);
+        let sharp = run_at("ec.stylize.mosaic", &[("horizontal", num(2.0)), ("vertical", num(1.0)), ("sharpColors", Value::Bool(true))], img.clone(), 0.0);
+        for y in 0..10 {
+            for x in 0..10 {
+                let expected_center = if x < 10 { img.get(5, 5) } else { img.get(15, 5) };
+                assert_eq!(sharp.img.get(x, y), expected_center);
+                let expected_x_avg = if x < 10 { 0.225 } else { 0.725 };
+                assert!((avg.img.get(x, y)[0] - expected_x_avg).abs() < 1e-4);
+            }
+        }
+    }
+
+    #[test]
     fn find_edges_and_emboss_blend_with_original() {
         let img = ramp(12, 12);
         for id in ["ec.stylize.findedges", "ec.stylize.emboss"] {
