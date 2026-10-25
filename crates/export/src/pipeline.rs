@@ -95,6 +95,9 @@ pub(crate) fn map_frames_while<I: Send, T: Send>(
 /// job's layer cache and per-frame timing for the render log.
 pub(crate) struct Cx<'a> {
     pub job: &'a Job<'a>,
+    /// The job's accelerator, unless it is a software (CPU) rasteriser: one renders export no
+    /// faster than the CPU compositor, so it counts as no GPU at all here (see [`Cx::new`]).
+    accel: Option<&'a dyn effectcraft_render::Accelerator>,
     pub project: Project,
     /// Processed layer buffers shared by the job's frames, as the viewer's layer cache: static
     /// and transform-only layers render once per job (the GPU compositor then uploads them
@@ -150,9 +153,23 @@ impl<'a> Cx<'a> {
         apply_overrides(&mut project, job);
         let frame_times = (job.options.log == RenderLog::PlusPerFrameInfo).then(|| Mutex::new(Vec::new()));
         let cache = LayerCache::default();
+        // A software (CPU) adapter renders export no faster than the CPU compositor, with the GPU
+        // path's limits: treat it as no accelerator at all (CPU renderer, no in-flight cap, no
+        // deferred passes). Real GPUs are unchanged; the host keeps owning the device.
+        let (accel, software) = match job.accel {
+            Some(a) if a.is_software() => (None, Some(a)),
+            other => (other, None),
+        };
+        if let Some(a) = software {
+            log::info!(
+                target: "effectcraft_export",
+                "GPU export skipped: adapter {} is a software renderer, so frames render on the CPU",
+                a.name()
+            );
+        }
         // With deferred readbacks, buffers computed from a missed pass's placeholders are not kept.
-        cache.set_gate(job.accel.and_then(|a| a.miss_gate()));
-        Cx { job, project, cache, frame_times, overflowed: Mutex::new(vec![]), written: Mutex::new(vec![]) }
+        cache.set_gate(accel.and_then(|a| a.miss_gate()));
+        Cx { job, accel, project, cache, frame_times, overflowed: Mutex::new(vec![]), written: Mutex::new(vec![]) }
     }
 
     pub fn comp(&self) -> Option<&Comp> {
@@ -166,7 +183,8 @@ impl<'a> Cx<'a> {
         // The whole job renders on the project's renderer (Mercury GPU Acceleration or Software
         // Only), not on whichever compositor Auto timed faster for each frame: the CPU and GPU
         // compositors differ slightly, so a per-frame choice made renders differ run to run.
-        let backend = if self.project.settings.gpu_acceleration { Backend::Gpu } else { Backend::Cpu };
+        // A software adapter was filtered out in `new()`: no accelerator, no GPU backend.
+        let backend = if self.project.settings.gpu_acceleration && self.accel.is_some() { Backend::Gpu } else { Backend::Cpu };
         let opts = RenderOpts {
             scale: s.resolution.clamp(0.01, 4.0),
             motion_blur: s.motion_blur_override() != SwitchOverride::OffForAll,
@@ -182,7 +200,7 @@ impl<'a> Cx<'a> {
         };
         let mut r = Renderer::new(&self.project, self.job.footage, opts);
         r.expr = self.job.expr;
-        r.accel = self.job.accel;
+        r.accel = self.accel;
         r.cache = Some(&self.cache);
         r
     }
@@ -194,7 +212,7 @@ impl<'a> Cx<'a> {
 
     /// Whether frames render in passes (an accelerator with deferred readbacks).
     pub fn deferred(&self) -> bool {
-        effectcraft_render::passes::is_deferred(self.job.accel)
+        effectcraft_render::passes::is_deferred(self.accel)
     }
 
     /// Output frames `ks`, each mapped by `f` (encoding): rendered in parallel batches, or one
@@ -210,7 +228,7 @@ impl<'a> Cx<'a> {
         }
         // The cap is for the GPU's memory: once it has stopped for good, frames render on the
         // CPU in parallel.
-        let gpu_live = || self.job.accel.is_none_or(|a| a.available());
+        let gpu_live = || self.accel.is_none_or(|a| a.available());
         map_frames_while(ks, self.gpu_cap(), gpu_live, |k| self.frame(comp, k), f)
     }
 
@@ -219,7 +237,7 @@ impl<'a> Cx<'a> {
     /// exhaust VRAM (or shared memory, which crashes instead of falling back). `None` when the
     /// frames render on the CPU: no accelerator, or a Software Only project.
     fn gpu_cap(&self) -> Option<usize> {
-        (self.job.accel.is_some() && self.project.settings.gpu_acceleration).then(|| gpu_inflight(std::env::var(GPU_INFLIGHT_ENV).ok().as_deref()))
+        (self.accel.is_some() && self.project.settings.gpu_acceleration).then(|| gpu_inflight(std::env::var(GPU_INFLIGHT_ENV).ok().as_deref()))
     }
 
     /// Output frame `i`: sampled (fields, pulldown), at the colour depth, cropped and resized.
@@ -598,6 +616,200 @@ mod tests {
         fn effects(&self, _chain: &[effectcraft_render::FxStep], _buf: &effectcraft_effects::Buf, _levels: Option<f32>) -> Option<effectcraft_effects::Buf> {
             None
         }
+    }
+
+    /// What a [`MockAccel`] was asked for.
+    #[derive(Default)]
+    struct Calls {
+        frames: std::sync::atomic::AtomicUsize,
+        effects: std::sync::atomic::AtomicUsize,
+        gates: std::sync::atomic::AtomicUsize,
+        available: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Calls {
+        fn total(&self) -> usize {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.frames.load(SeqCst) + self.effects.load(SeqCst) + self.gates.load(SeqCst) + self.available.load(SeqCst)
+        }
+    }
+
+    /// A hardware-looking or software accelerator that counts every GPU hook export calls.
+    struct MockAccel {
+        software: bool,
+        /// A deferred readback gate: its presence makes [`effectcraft_render::passes::is_deferred`] true.
+        gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        calls: std::sync::Arc<Calls>,
+    }
+
+    impl MockAccel {
+        fn new(software: bool, deferred: bool) -> MockAccel {
+            MockAccel { software, gate: deferred.then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))), calls: Default::default() }
+        }
+    }
+
+    impl effectcraft_render::Accelerator for MockAccel {
+        fn name(&self) -> String {
+            "Mock Adapter (Vulkan)".into()
+        }
+        fn is_software(&self) -> bool {
+            self.software
+        }
+        fn comp_frame(&self, _r: &Renderer, _comp: effectcraft_project::ItemId, _t: Tick) -> Option<Image> {
+            self.calls.frames.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }
+        fn supports_effect(&self, _id: &str) -> bool {
+            false
+        }
+        fn effects(&self, _chain: &[effectcraft_render::FxStep], _buf: &effectcraft_effects::Buf, _levels: Option<f32>) -> Option<effectcraft_effects::Buf> {
+            self.calls.effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }
+        fn miss_gate(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+            self.calls.gates.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.gate.clone()
+        }
+        fn available(&self) -> bool {
+            self.calls.available.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+    }
+
+    /// A 16x16 red-solid comp in its own project.
+    fn red_solid_project() -> (Project, effectcraft_project::ItemId) {
+        use effectcraft_color::Label;
+        use effectcraft_project::{ItemKind, LayerSource, Solid, build};
+        use effectcraft_time::FrameRate;
+        let mut p = Project::default();
+        let mut comp = Comp::new(16, 16, FrameRate::FPS_25, Tick::from_seconds_f64(1.0));
+        let sid = p.add_item("Solid", Label::Red, None, ItemKind::Solid(Solid { color: [1.0, 0.0, 0.0], width: 16, height: 16, pixel_aspect: 1.0 }));
+        let l = build::layer(&mut p, &comp, "Solid", LayerSource::Solid { item: sid }, (16, 16), None);
+        comp.layers.push(l);
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+        (p, cid)
+    }
+
+    /// Render `ks` through [`Cx::frames`], returning each image with its frame number.
+    fn render_frames(cx: &Cx<'_>, comp: &Comp, ks: Vec<u64>) -> Vec<(u64, Image)> {
+        effectcraft_render::passes::block_on(cx.frames(comp, ks, |k, img| (k, img)))
+    }
+
+    #[test]
+    fn software_accelerators_use_cpu_export() {
+        // A software adapter renders on the CPU anyway: export must not take the GPU path (its
+        // backend, its in-flight cap, or its deferred passes) for it.
+        use effectcraft_project::render_queue::{OutputFormat, OutputModule, RenderSettings};
+        use effectcraft_render::NoFootage;
+        let (mut p, cid) = red_solid_project();
+        let (settings, output) = (RenderSettings::default(), OutputModule::for_format(OutputFormat::PngSequence));
+        let accel = MockAccel::new(true, true);
+        for gpu in [true, false] {
+            p.settings.gpu_acceleration = gpu;
+            let job = Job {
+                project: &p,
+                footage: &NoFootage,
+                expr: None,
+                accel: Some(&accel),
+                comp: cid,
+                settings: &settings,
+                output: &output,
+                path: "/c/f_[#####].png",
+                sink: None,
+                nested_switches: true,
+                options: Default::default(),
+            };
+            let cx = Cx::new(&job);
+            {
+                let r = cx.renderer();
+                assert_eq!(r.opts.backend, Backend::Cpu, "gpu acceleration {gpu}");
+                assert!(r.accel.is_none(), "the software adapter is not handed to the renderer");
+            }
+            assert_eq!(cx.gpu_cap(), None, "gpu acceleration {gpu}");
+            assert!(!cx.deferred(), "gpu acceleration {gpu}");
+            let comp = cx.comp().expect("the comp exists");
+            let imgs = render_frames(&cx, comp, vec![0, 1]);
+            assert_eq!(imgs.len(), 2);
+            assert_eq!(accel.calls.total(), 0, "no GPU hook runs for a software adapter (gpu acceleration {gpu})");
+        }
+    }
+
+    #[test]
+    fn software_export_matches_software_only() {
+        // Exporting through a software adapter is Software Only: the same exact pixels.
+        use effectcraft_project::render_queue::{OutputFormat, OutputModule, RenderSettings};
+        let (mut p, cid) = red_solid_project();
+        let (settings, output) = (RenderSettings::default(), OutputModule::for_format(OutputFormat::PngSequence));
+        fn export<'a>(
+            project: &'a Project,
+            accel: Option<&'a dyn effectcraft_render::Accelerator>,
+            comp: effectcraft_project::ItemId,
+            settings: &'a RenderSettings,
+            output: &'a OutputModule,
+        ) -> Job<'a> {
+            Job {
+                project,
+                footage: &effectcraft_render::NoFootage,
+                expr: None,
+                accel,
+                comp,
+                settings,
+                output,
+                path: "/c/f_[#####].png",
+                sink: None,
+                nested_switches: true,
+                options: Default::default(),
+            }
+        }
+        p.settings.gpu_acceleration = true;
+        let accel = MockAccel::new(true, true);
+        let (gpu, mut only) = (p.clone(), p);
+        only.settings.gpu_acceleration = false;
+        let with_software = export(&gpu, Some(&accel), cid, &settings, &output);
+        let with_only = export(&only, None, cid, &settings, &output);
+        let (with_software, with_only) = (Cx::new(&with_software), Cx::new(&with_only));
+        let ks = vec![0, 1, 2];
+        let a = render_frames(&with_software, with_software.comp().expect("the comp exists"), ks.clone());
+        let b = render_frames(&with_only, with_only.comp().expect("the comp exists"), ks);
+        assert_eq!(a.len(), 3);
+        for ((ka, a), (kb, b)) in a.iter().zip(&b) {
+            assert_eq!(ka, kb);
+            assert_eq!((a.width, a.height), (b.width, b.height), "frame {ka}");
+            assert_eq!(a.data, b.data, "frame {ka} pixels");
+        }
+        assert_eq!(accel.calls.total(), 0, "no GPU hook runs for a software adapter");
+    }
+
+    #[test]
+    fn hardware_export_retains_gpu() {
+        // Real hardware keeps the GPU renderer, its accelerator and its in-flight cap.
+        use effectcraft_project::render_queue::{OutputFormat, OutputModule, RenderSettings};
+        use effectcraft_render::NoFootage;
+        let (mut p, cid) = red_solid_project();
+        let (settings, output) = (RenderSettings::default(), OutputModule::for_format(OutputFormat::PngSequence));
+        p.settings.gpu_acceleration = true;
+        let accel = MockAccel::new(false, true);
+        let job = Job {
+            project: &p,
+            footage: &NoFootage,
+            expr: None,
+            accel: Some(&accel),
+            comp: cid,
+            settings: &settings,
+            output: &output,
+            path: "/c/f_[#####].png",
+            sink: None,
+            nested_switches: true,
+            options: Default::default(),
+        };
+        let cx = Cx::new(&job);
+        {
+            let r = cx.renderer();
+            assert_eq!(r.opts.backend, Backend::Gpu);
+            assert!(r.accel.is_some(), "the hardware adapter reaches the renderer");
+        }
+        assert!(cx.gpu_cap().is_some());
+        assert!(cx.deferred(), "a hardware adapter with deferred readbacks still renders in passes");
     }
 
     #[test]
