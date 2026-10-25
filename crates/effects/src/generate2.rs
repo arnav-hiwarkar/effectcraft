@@ -887,6 +887,10 @@ fn advanced_lightning(ctx: &EffectCtx, mut b: Buf) -> Buf {
 const RAY_STEPS: usize = 32;
 
 fn light_rays(ctx: &EffectCtx, mut b: Buf) -> Buf {
+    let mode = ctx.params.e("transferMode");
+    if ctx.params.f("intensity") <= 0.0 && mode != 3 {
+        return b;
+    }
     let c = b.to_px(ctx.params.v2("center"));
     let k = (ctx.params.f("intensity") / 100.0 * 0.5).clamp(0.0, 0.95);
     let gain = (ctx.params.f("intensity") / 100.0 * 2.0) as f32;
@@ -895,7 +899,6 @@ fn light_rays(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let square = ctx.params.e("shape") == 1;
     let from_src = ctx.params.b("colorFromSource");
     let color = ctx.params.color("color");
-    let mode = ctx.params.e("transferMode");
     let src = b.img.clone();
     let mask = |x: f64, y: f64| {
         let (dx, dy) = ((x - c.0).abs(), (y - c.1).abs());
@@ -995,15 +998,18 @@ fn light_burst(ctx: &EffectCtx, mut b: Buf) -> Buf {
 // ---------------------------------------------------------------- CC Light Sweep
 
 fn light_sweep(ctx: &EffectCtx, mut b: Buf) -> Buf {
+    let sweep = (ctx.params.f("sweepIntensity") / 100.0) as f32;
+    let edge_i = (ctx.params.f("edgeIntensity") / 100.0) as f32;
+    let mode = ctx.params.e("lightReceptionMode");
+    if sweep <= 0.0 && edge_i <= 0.0 && mode != 2 {
+        return b;
+    }
     let c = b.to_px(ctx.params.v2("center"));
     let dir = ctx.params.f("direction").to_radians();
     let shape = ctx.params.e("shape");
     let half = (ctx.params.f("width") * b.scale * 0.5).max(0.5);
-    let sweep = (ctx.params.f("sweepIntensity") / 100.0) as f32;
-    let edge_i = (ctx.params.f("edgeIntensity") / 100.0) as f32;
     let edge_t = ctx.params.f("edgeThickness") * b.scale;
     let lc = ctx.params.color("lightColor");
-    let mode = ctx.params.e("lightReceptionMode");
     let (nx, ny) = (dir.cos(), dir.sin());
     let alpha = Plane::alpha(&b.img);
     let soft_a = if edge_t > 0.05 { gauss_plane(&alpha, edge_t * 0.5, edge_t * 0.5) } else { alpha };
@@ -1533,5 +1539,65 @@ mod tests {
         assert_eq!(CELL_PATTERNS[9], "Crystallize HQ");
         assert_ne!(std, hq);
         assert!(distinct(&hq) > distinct(&std) * 2, "{} vs {}", distinct(&hq), distinct(&std));
+    }
+
+    #[test]
+    fn light_rays_neutral_parameters_identity() {
+        let mut img = Image::new(16, 16);
+        for y in 0..16 {
+            for x in 0..16 {
+                let v = ((x + y * 16) as f32) / 256.0;
+                img.set(x, y, [v * 0.8, v * 0.5, v * 0.3, 0.9]);
+            }
+        }
+
+        for mode in [0, 1, 2] {
+            let out = run("ec.generate.cclightrays", &[("intensity", num(0.0)), ("transferMode", Value::Enum(mode))], img.clone());
+            assert_eq!(out.img, img, "mode {mode} should return identical image on intensity=0.0");
+        }
+
+        let out_mode3 = run("ec.generate.cclightrays", &[("intensity", num(0.0)), ("transferMode", Value::Enum(3))], img.clone());
+        assert_ne!(out_mode3.img, img);
+        assert!(out_mode3.img.data.iter().all(|p| *p == [0.0; 4]));
+
+        let out_active = run("ec.generate.cclightrays", &[("intensity", num(100.0)), ("transferMode", Value::Enum(0))], img.clone());
+        assert_ne!(out_active.img, img);
+    }
+
+    #[test]
+    fn light_sweep_neutral_parameters_identity() {
+        let mut img = Image::new(16, 16);
+        for y in 0..16 {
+            for x in 0..16 {
+                let v = ((x + y * 16) as f32) / 256.0;
+                let a = if (4..12).contains(&x) && (4..12).contains(&y) { 0.9 } else { 0.2 };
+                img.set(x, y, [v * 0.8 * a, v * 0.5 * a, v * 0.3 * a, a]);
+            }
+        }
+
+        for mode in [0, 1] {
+            let out = run(
+                "ec.generate.cclightsweep",
+                &[("sweepIntensity", num(0.0)), ("edgeIntensity", num(0.0)), ("lightReceptionMode", Value::Enum(mode))],
+                img.clone(),
+            );
+            assert_eq!(out.img, img, "mode {mode} should return identical image on 0 intensity");
+        }
+
+        let out_mode2 =
+            run("ec.generate.cclightsweep", &[("sweepIntensity", num(0.0)), ("edgeIntensity", num(0.0)), ("lightReceptionMode", Value::Enum(2))], img.clone());
+        assert_ne!(out_mode2.img, img);
+        assert!(out_mode2.img.data.iter().all(|p| *p == [0.0; 4]));
+
+        let out_sweep =
+            run("ec.generate.cclightsweep", &[("sweepIntensity", num(50.0)), ("edgeIntensity", num(0.0)), ("lightReceptionMode", Value::Enum(0))], img.clone());
+        assert_ne!(out_sweep.img, img);
+
+        let out_edge = run(
+            "ec.generate.cclightsweep",
+            &[("sweepIntensity", num(0.0)), ("edgeIntensity", num(100.0)), ("lightReceptionMode", Value::Enum(0))],
+            img.clone(),
+        );
+        assert_ne!(out_edge.img, img);
     }
 }
