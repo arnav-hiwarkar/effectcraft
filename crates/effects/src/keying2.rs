@@ -7,7 +7,7 @@ use effectcraft_project::ParamUi;
 use effectcraft_raster::gaussian_blur;
 use rayon::prelude::*;
 
-use crate::util::{Plane, dist_to_poly, gauss_plane, layer_or_self, lerp4, morph_frac, point_in_poly, premul, smoothstep, unpremul};
+use crate::util::{Plane, dist_to_poly, fit_layer, gauss_plane, lerp4, morph_frac, point_in_poly, premul, smoothstep, unpremul};
 use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
@@ -27,18 +27,10 @@ fn difference_matte(ctx: &EffectCtx, mut b: Buf) -> Buf {
     }
     let tol = (ctx.params.f("matchingTolerance") / 100.0) as f32;
     let soft = (ctx.params.f("matchingSoftness") / 100.0) as f32;
-    let blur = ctx.params.f("blurBeforeDifference") * b.scale;
-    let other = layer_or_self(ctx, &b, "differenceLayer", true, ctx.params.e("ifLayerSizesDiffer") == 1);
-    let (src, other) = if blur > 0.05 {
-        (gaussian_blur(&b.img, blur * 0.5, blur * 0.5, true), gaussian_blur(&other, blur * 0.5, blur * 0.5, true))
-    } else {
-        (b.img.clone(), other)
-    };
     let matte_only = view == 2;
-    b.img.data.par_iter_mut().enumerate().for_each(|(i, px)| {
-        let (c, a) = unpremul(src.data[i]);
-        let (oc, oa) = unpremul(other.data[i]);
-        let d = (c[0] - oc[0]).abs().max((c[1] - oc[1]).abs()).max((c[2] - oc[2]).abs()).max((a - oa).abs());
+
+    let Some(other_layer) = ctx.layer_param("differenceLayer", true) else {
+        let d = 0.0f32;
         let m = if d <= tol {
             0.0
         } else if soft <= 1e-6 {
@@ -47,11 +39,56 @@ fn difference_matte(ctx: &EffectCtx, mut b: Buf) -> Buf {
             ((d - tol) / soft).clamp(0.0, 1.0)
         };
         if matte_only {
-            *px = [m * px[3], m * px[3], m * px[3], px[3]];
+            b.img.data.par_iter_mut().for_each(|px| {
+                *px = [m * px[3], m * px[3], m * px[3], px[3]];
+            });
+        } else if m == 0.0 {
+            b.img.data.fill([0.0; 4]);
         } else {
-            *px = px.map(|v| v * m);
+            b.img.data.par_iter_mut().for_each(|px| {
+                *px = px.map(|v| v * m);
+            });
         }
-    });
+        return b;
+    };
+
+    let other = fit_layer(ctx, &b, &other_layer, ctx.params.e("ifLayerSizesDiffer") == 1);
+    let blur = ctx.params.f("blurBeforeDifference") * b.scale;
+    let calc_m = |c: [f32; 3], a: f32, oc: [f32; 3], oa: f32| -> f32 {
+        let d = (c[0] - oc[0]).abs().max((c[1] - oc[1]).abs()).max((c[2] - oc[2]).abs()).max((a - oa).abs());
+        if d <= tol {
+            0.0
+        } else if soft <= 1e-6 {
+            1.0
+        } else {
+            ((d - tol) / soft).clamp(0.0, 1.0)
+        }
+    };
+    if blur > 0.05 {
+        let src = gaussian_blur(&b.img, blur * 0.5, blur * 0.5, true);
+        let other = gaussian_blur(&other, blur * 0.5, blur * 0.5, true);
+        b.img.data.par_iter_mut().zip(src.data.par_iter().zip(other.data.par_iter())).for_each(|(px, (spx, opx))| {
+            let (c, a) = unpremul(*spx);
+            let (oc, oa) = unpremul(*opx);
+            let m = calc_m(c, a, oc, oa);
+            if matte_only {
+                *px = [m * px[3], m * px[3], m * px[3], px[3]];
+            } else {
+                *px = px.map(|v| v * m);
+            }
+        });
+    } else {
+        b.img.data.par_iter_mut().zip(other.data.par_iter()).for_each(|(px, opx)| {
+            let (c, a) = unpremul(*px);
+            let (oc, oa) = unpremul(*opx);
+            let m = calc_m(c, a, oc, oa);
+            if matte_only {
+                *px = [m * px[3], m * px[3], m * px[3], px[3]];
+            } else {
+                *px = px.map(|v| v * m);
+            }
+        });
+    }
     b
 }
 
@@ -485,6 +522,85 @@ mod tests {
     use crate::channel2::tests::{FakeHost, sample};
     use crate::{EffectEnv, MaskShape, run_fx};
     use effectcraft_raster::Image;
+
+    #[test]
+    fn difference_matte_self_no_alloc_and_layer_diff_parity() {
+        let img = sample();
+
+        // 1. Default Difference Matte (differenceLayer: None) with view == 0 (Final Output):
+        // Sets all pixels to transparent black ([0.0; 4]).
+        let out_final = run_fx("ec.key.differencematte", &[], img.clone(), 0.0, EffectEnv::default());
+        assert!(out_final.img.data.iter().all(|p| *p == [0.0; 4]));
+
+        // 2. Default Difference Matte with view == 2 (Matte Only):
+        // Sets RGB to 0.0 while preserving original alpha.
+        let out_matte = run_fx("ec.key.differencematte", &[("view", Value::Enum(2))], img.clone(), 0.0, EffectEnv::default());
+        for (p_orig, p_out) in img.data.iter().zip(out_matte.img.data.iter()) {
+            assert_eq!(p_out[0], 0.0);
+            assert_eq!(p_out[1], 0.0);
+            assert_eq!(p_out[2], 0.0);
+            assert_eq!(p_out[3], p_orig[3]);
+        }
+
+        // 3. With an external layer and blur = 0.0, verify reference tolerance and softness calculations:
+        let host = FakeHost(Image::filled(8, 6, [0.1, 0.2, 0.3, 1.0]));
+        let env = EffectEnv { host: Some(&host), ..Default::default() };
+        let tol = 20.0;
+        let soft = 10.0;
+        let out_layer = run_fx(
+            "ec.key.differencematte",
+            &[("differenceLayer", Value::Layer(Some(7))), ("matchingTolerance", num(tol)), ("matchingSoftness", num(soft)), ("blurBeforeDifference", num(0.0))],
+            img.clone(),
+            0.0,
+            env,
+        );
+
+        let tol_f = (tol / 100.0) as f32;
+        let soft_f = (soft / 100.0) as f32;
+        for (i, px) in img.data.iter().enumerate() {
+            let (c, a) = unpremul(*px);
+            let (oc, oa) = unpremul([0.1, 0.2, 0.3, 1.0]);
+            let d = (c[0] - oc[0]).abs().max((c[1] - oc[1]).abs()).max((c[2] - oc[2]).abs()).max((a - oa).abs());
+            let m = if d <= tol_f {
+                0.0
+            } else if soft_f <= 1e-6 {
+                1.0
+            } else {
+                ((d - tol_f) / soft_f).clamp(0.0, 1.0)
+            };
+            let expected = px.map(|v| v * m);
+            assert_eq!(out_layer.img.data[i], expected);
+        }
+
+        let out_layer_matte = run_fx(
+            "ec.key.differencematte",
+            &[
+                ("differenceLayer", Value::Layer(Some(7))),
+                ("matchingTolerance", num(tol)),
+                ("matchingSoftness", num(soft)),
+                ("blurBeforeDifference", num(0.0)),
+                ("view", Value::Enum(2)),
+            ],
+            img.clone(),
+            0.0,
+            env,
+        );
+        for (i, px) in out_layer_matte.img.data.iter().enumerate() {
+            let orig_px = img.data[i];
+            let (c, a) = unpremul(orig_px);
+            let (oc, oa) = unpremul([0.1, 0.2, 0.3, 1.0]);
+            let d = (c[0] - oc[0]).abs().max((c[1] - oc[1]).abs()).max((c[2] - oc[2]).abs()).max((a - oa).abs());
+            let m = if d <= tol_f {
+                0.0
+            } else if soft_f <= 1e-6 {
+                1.0
+            } else {
+                ((d - tol_f) / soft_f).clamp(0.0, 1.0)
+            };
+            let expected = [m * orig_px[3], m * orig_px[3], m * orig_px[3], orig_px[3]];
+            assert_eq!(*px, expected);
+        }
+    }
 
     #[test]
     fn difference_matte_self_is_transparent_and_other_keeps() {
