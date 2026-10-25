@@ -12,7 +12,7 @@ use effectcraft_project::ParamUi;
 use effectcraft_raster::{Image, Px};
 use rayon::prelude::*;
 
-use crate::util::{Plane, fit_layer, gauss_plane, layer_or_self, lerp4, smoothstep, unpremul};
+use crate::util::{Plane, fit_layer, gauss_plane, lerp4, smoothstep, unpremul};
 use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
@@ -53,6 +53,13 @@ fn prop_plane(img: &Image, prop: u32) -> Plane {
     })
 }
 
+fn layer_plane(ctx: &EffectCtx, b: &Buf, id: &str, prop: u32) -> Plane {
+    match ctx.layer_param(id, true) {
+        Some(o) => prop_plane(&fit_layer(ctx, b, &o, false), prop),
+        None => prop_plane(&b.img, prop),
+    }
+}
+
 /// Fraction of a pixel with gradient value `g` that has transitioned, for a soft band of
 /// half-width `w`: none at completion 0, all at completion 1.
 #[inline]
@@ -75,8 +82,7 @@ fn glass_wipe(ctx: &EffectCtx, mut b: Buf) -> Buf {
     if c <= 0.0 {
         return b;
     }
-    let gimg = layer_or_self(ctx, &b, "gradientLayer", true, false);
-    let mut g = prop_plane(&gimg, 4);
+    let mut g = layer_plane(ctx, &b, "gradientLayer", 4);
     let soft = (ctx.params.f("softness") / 100.0) as f32;
     let sm = ctx.params.f("softness") * b.scale * 0.2;
     if sm > 0.05 {
@@ -112,8 +118,7 @@ fn image_wipe(ctx: &EffectCtx, mut b: Buf) -> Buf {
     if c <= 0.0 {
         return b;
     }
-    let gimg = layer_or_self(ctx, &b, "layer", true, false);
-    let mut g = prop_plane(&gimg, ctx.params.e("property"));
+    let mut g = layer_plane(ctx, &b, "layer", ctx.params.e("property"));
     let bl = ctx.params.f("blur") * b.scale * 0.5;
     if bl > 0.05 {
         g = gauss_plane(&g, bl, bl);
@@ -290,8 +295,7 @@ fn warpomatic(ctx: &EffectCtx, mut b: Buf) -> Buf {
     if c <= 0.0 {
         return b;
     }
-    let rimg = layer_or_self(ctx, &b, "reactorLayer", true, false);
-    let mut m = prop_plane(&rimg, 4);
+    let mut m = layer_plane(ctx, &b, "reactorLayer", 4);
     let sm = ctx.params.f("smoothness") * b.scale * 0.5;
     if sm > 0.05 {
         m = gauss_plane(&m, sm, sm);
@@ -432,7 +436,18 @@ pub fn specs() -> Vec<EffectSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EffectEnv, run_fx};
+    use crate::{EffectEnv, EffectHost, LayerPixels, run_fx};
+
+    struct TestHost(Image);
+    impl EffectHost for TestHost {
+        fn layer(&self, id: u64, _: bool) -> Option<LayerPixels> {
+            (id == 42)
+                .then(|| LayerPixels { buf: Buf { img: self.0.clone(), offset: [0.0; 2], scale: 1.0 }, size: [self.0.width as f64, self.0.height as f64] })
+        }
+        fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+            None
+        }
+    }
 
     fn ramp(w: u32, h: u32) -> Image {
         let mut img = Image::new(w, h);
@@ -540,5 +555,59 @@ mod tests {
         // Red ramps left→right: dark (left) side goes first.
         assert!(o.img.data[16 * 40 + 2][3] < 0.01);
         assert!(o.img.data[16 * 40 + 37][3] > 0.99);
+    }
+
+    #[test]
+    fn wipe_effects_layer_or_self_consistency() {
+        let img = ramp(40, 32);
+        let host = TestHost(img.clone());
+        let env = EffectEnv { host: Some(&host), ..Default::default() };
+
+        let completions = [0.0, 25.0, 50.0, 75.0, 100.0];
+
+        // 1. CC Glass Wipe
+        for &c in &completions {
+            let self_out = run_fx("ec.transition.ccglasswipe", &[("completion", num(c))], img.clone(), 0.0, EffectEnv::default());
+            let host_out = run_fx("ec.transition.ccglasswipe", &[("completion", num(c)), ("gradientLayer", Value::Layer(Some(42)))], img.clone(), 0.0, env);
+            assert_eq!(self_out.img.data, host_out.img.data, "glass_wipe at completion {c}");
+        }
+
+        // 2. CC Image Wipe: completions and all gradient properties
+        for &c in &completions {
+            let self_out = run_fx("ec.transition.ccimagewipe", &[("completion", num(c))], img.clone(), 0.0, EffectEnv::default());
+            let host_out = run_fx("ec.transition.ccimagewipe", &[("completion", num(c)), ("layer", Value::Layer(Some(42)))], img.clone(), 0.0, env);
+            assert_eq!(self_out.img.data, host_out.img.data, "image_wipe at completion {c}");
+        }
+        for prop in 0..7 {
+            let self_out =
+                run_fx("ec.transition.ccimagewipe", &[("completion", num(50.0)), ("property", Value::Enum(prop))], img.clone(), 0.0, EffectEnv::default());
+            let host_out = run_fx(
+                "ec.transition.ccimagewipe",
+                &[("completion", num(50.0)), ("property", Value::Enum(prop)), ("layer", Value::Layer(Some(42)))],
+                img.clone(),
+                0.0,
+                env,
+            );
+            assert_eq!(self_out.img.data, host_out.img.data, "image_wipe property {prop}");
+        }
+
+        // 3. CC WarpoMatic: completions and reactor modes
+        for &c in &completions {
+            let self_out = run_fx("ec.transition.ccwarpomatic", &[("completion", num(c))], img.clone(), 0.0, EffectEnv::default());
+            let host_out = run_fx("ec.transition.ccwarpomatic", &[("completion", num(c)), ("reactorLayer", Value::Layer(Some(42)))], img.clone(), 0.0, env);
+            assert_eq!(self_out.img.data, host_out.img.data, "warpomatic at completion {c}");
+        }
+        for reactor in 0..3 {
+            let self_out =
+                run_fx("ec.transition.ccwarpomatic", &[("completion", num(50.0)), ("reactor", Value::Enum(reactor))], img.clone(), 0.0, EffectEnv::default());
+            let host_out = run_fx(
+                "ec.transition.ccwarpomatic",
+                &[("completion", num(50.0)), ("reactor", Value::Enum(reactor)), ("reactorLayer", Value::Layer(Some(42)))],
+                img.clone(),
+                0.0,
+                env,
+            );
+            assert_eq!(self_out.img.data, host_out.img.data, "warpomatic reactor {reactor}");
+        }
     }
 }
