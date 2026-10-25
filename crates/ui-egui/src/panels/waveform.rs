@@ -22,6 +22,78 @@ pub const BINS_PER_SEC: u32 = 200;
 pub struct Summary {
     pub bins_per_sec: u32,
     pub peaks: Vec<[f32; 4]>,
+    /// Min/max pyramid: `levels[j][i]` aggregates entries `i * 8..(i + 1) * 8` of the level
+    /// below it (the base peaks below `j == 0`), so `levels[j][i]` spans `8^(j + 1)` bins.
+    /// `range` only ever reads fully covered entries, so coarser levels are exact too.
+    levels: Vec<Vec<[f32; 4]>>,
+}
+
+/// Folds a bin or pyramid entry into `[min L, max L, min R, max R]` from the zero baseline.
+fn fold(agg: &mut [f32; 4], b: &[f32; 4]) {
+    agg[0] = agg[0].min(b[0]);
+    agg[1] = agg[1].max(b[1]);
+    agg[2] = agg[2].min(b[2]);
+    agg[3] = agg[3].max(b[3]);
+}
+
+impl Summary {
+    /// Builds the summary and its min/max pyramid (about +14% memory on the peaks).
+    pub fn new(bins_per_sec: u32, peaks: Vec<[f32; 4]>) -> Self {
+        let mut levels: Vec<Vec<[f32; 4]>> = Vec::new();
+        let mut len = peaks.len();
+        while len > 1 {
+            let mut next = Vec::with_capacity(len.div_ceil(8));
+            let src: &[[f32; 4]] = match levels.last() {
+                Some(l) => l.as_slice(),
+                None => &peaks,
+            };
+            for kids in src.chunks(8) {
+                let mut agg = [0.0f32; 4];
+                for kid in kids {
+                    fold(&mut agg, kid);
+                }
+                next.push(agg);
+            }
+            levels.push(next);
+            len = levels.last().map_or(0, |l| l.len());
+        }
+        Self { bins_per_sec, peaks, levels }
+    }
+
+    /// Exact min/max fold of bins `[ba, bb)` from the zero baseline, as `draw`'s fold over
+    /// `peaks[ba..bb]`, by decomposing bottom-up over the pyramid; `[0.0; 4]` when `ba >= bb`.
+    /// At most 14 entry reads per level, so the cost barely grows with the span.
+    pub fn range(&self, ba: usize, bb: usize) -> [f32; 4] {
+        let mut agg = [0.0f32; 4];
+        let n = self.peaks.len();
+        let (mut l, mut r) = (ba.min(bb).min(n), bb.min(n));
+        for src in std::iter::once(self.peaks.as_slice()).chain(self.levels.iter().map(Vec::as_slice)) {
+            let (nl, nr) = ((l + 7) & !7, r & !7);
+            if nl >= nr {
+                // The range fits inside one 8-aligned block at this level: fold it and stop.
+                if let Some(mid) = src.get(l..r) {
+                    for a in mid {
+                        fold(&mut agg, a);
+                    }
+                }
+                return agg;
+            }
+            // Fold the ragged edges at this level and continue with the aligned middle.
+            if let Some(edge) = src.get(l..nl) {
+                for a in edge {
+                    fold(&mut agg, a);
+                }
+            }
+            if let Some(edge) = src.get(nr..r) {
+                for a in edge {
+                    fold(&mut agg, a);
+                }
+            }
+            l = nl / 8;
+            r = nr / 8;
+        }
+        agg
+    }
 }
 
 /// Summaries by footage item (`None` while computing).
@@ -68,7 +140,7 @@ pub fn summary(app: &EffectcraftApp, ctx: &egui::Context, item: ItemId) -> Optio
                 }
             };
             if let Ok(mut m) = map.lock() {
-                m.insert(item.0, Some(Arc::new(Summary { bins_per_sec: BINS_PER_SEC, peaks })));
+                m.insert(item.0, Some(Arc::new(Summary::new(BINS_PER_SEC, peaks))));
             }
             ctx.request_repaint();
         })
@@ -107,13 +179,7 @@ pub(crate) fn draw(p: &Painter, rect: Rect, tm: &TMap, layer: &Layer, s: &Summar
         if ba >= bb {
             continue;
         }
-        let mut agg = [0.0f32; 4];
-        for b in &s.peaks[ba as usize..bb as usize] {
-            agg[0] = agg[0].min(b[0]);
-            agg[1] = agg[1].max(b[1]);
-            agg[2] = agg[2].min(b[2]);
-            agg[3] = agg[3].max(b[3]);
-        }
+        let agg = s.range(ba as usize, bb as usize);
         let gain = level_gains(levels, Tick::from_seconds_f64((ta + tb) * 0.5));
         for c in 0..2 {
             let (lo, hi) = ((agg[c * 2] * gain[c]).clamp(-1.0, 1.0), (agg[c * 2 + 1] * gain[c]).clamp(-1.0, 1.0));
@@ -135,5 +201,109 @@ mod tests {
         assert!((g[0] - 0.5).abs() < 1e-3, "{}", g[0]);
         assert_eq!(g[1], 0.0);
         assert_eq!(level_gains(None, Tick::ZERO), [1.0, 1.0]);
+    }
+
+    /// Deterministic pseudo-random value in about `[-0.7, 0.7]`.
+    fn rnd(seed: &mut u64) -> f32 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 33) as f32 / 2147483647.0) * 1.4 - 0.7
+    }
+
+    /// `n` deterministic pseudo-random bins `[min L, max L, min R, max R]`,
+    /// with a 2.9-wide spike written into each index in `spikes`.
+    fn random_peaks(seed: u64, n: usize, spikes: &[usize]) -> Vec<[f32; 4]> {
+        let mut seed = seed;
+        let mut peaks = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (a, b, c, d) = (rnd(&mut seed), rnd(&mut seed), rnd(&mut seed), rnd(&mut seed));
+            peaks.push([a.min(b), a.max(b), c.min(d), c.max(d)]);
+        }
+        for &i in spikes {
+            peaks[i] = [0.0, 2.9, 0.0, 2.9];
+        }
+        peaks
+    }
+
+    /// The brute-force fold `draw` used to do per column.
+    fn fold_brute(peaks: &[[f32; 4]], ba: usize, bb: usize) -> [f32; 4] {
+        let mut agg = [0.0f32; 4];
+        for b in &peaks[ba..bb] {
+            agg[0] = agg[0].min(b[0]);
+            agg[1] = agg[1].max(b[1]);
+            agg[2] = agg[2].min(b[2]);
+            agg[3] = agg[3].max(b[3]);
+        }
+        agg
+    }
+
+    #[test]
+    fn pyramid_range_matches_brute_force() {
+        let n = BINS_PER_SEC as usize * 600 + 3; // 10 minutes with an odd tail: 120,003 bins
+        let s = Summary::new(BINS_PER_SEC, random_peaks(0x9E3779B97F4A7C15, n, &[3, 511, 4096, 65_000, n - 1]));
+        let mut spans = Vec::new();
+        for start in [0, 1, 7, 8, 63, 64, 511, 512, 1000, 4095, n / 2, n - 45] {
+            for width in 1..=40 {
+                spans.push((start, start + width));
+            }
+        }
+        for (ba, bb) in [(0, 1000), (500, 11_500), (7, n), (0, n), (64, n - 64), (n - 1000, n), (n / 2, n / 2 + 10_000)] {
+            spans.push((ba, bb));
+        }
+        for (ba, bb) in spans {
+            assert_eq!(s.range(ba, bb), fold_brute(&s.peaks, ba, bb), "range {ba}..{bb}");
+        }
+    }
+
+    #[test]
+    fn pyramid_never_loses_a_spike() {
+        let n = BINS_PER_SEC as usize * 600 + 3;
+        for i in [0, 7, 8, 63, 64, 4095, 4096, n / 2, n - 2, n - 1] {
+            let s = Summary::new(BINS_PER_SEC, random_peaks(0xC0FFEE00, n, &[i]));
+            for width in [1, 7, 64, 120, 5000] {
+                let (ba, bb) = (i.saturating_sub(width / 2), (i.saturating_sub(width / 2) + width).min(n));
+                let agg = s.range(ba, bb);
+                // Only the spiked bin reaches 2.9; a coarser fold must not lose it.
+                assert_eq!(agg[1], 2.9, "spike {i}, width {width}");
+                assert_eq!(agg[3], 2.9, "spike {i}, width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn pyramid_handles_tiny_summaries() {
+        for n in [0usize, 1, 7, 8, 9] {
+            let s = Summary::new(BINS_PER_SEC, random_peaks(0xABCDEF, n, &[]));
+            assert_eq!(s.range(0, n), fold_brute(&s.peaks, 0, n), "n {n}");
+            assert_eq!(s.range(2, 2), [0.0; 4], "empty span at n {n}");
+            assert_eq!(s.range(n + 1, n + 2), [0.0; 4], "out-of-bounds span at n {n}");
+            if n > 1 {
+                assert_eq!(s.range(n / 2 + 1, n / 2), [0.0; 4], "reversed span at n {n}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn pyramid_aggregate_timing() {
+        let n = BINS_PER_SEC as usize * 3600; // 1 h: 720,000 bins
+        let s = Summary::new(BINS_PER_SEC, random_peaks(0x5EED1234, n, &[17, 1000, 123_456, n - 1]));
+        let cols = 1000;
+        let width = n / cols; // 720 bins per column
+        let (mut brute, mut pyr) = (Vec::new(), Vec::new());
+        for _ in 0..50 {
+            let start = std::time::Instant::now();
+            for c in 0..cols {
+                std::hint::black_box(fold_brute(&s.peaks, c * width, (c + 1) * width));
+            }
+            brute.push(start.elapsed());
+            let start = std::time::Instant::now();
+            for c in 0..cols {
+                std::hint::black_box(s.range(c * width, (c + 1) * width));
+            }
+            pyr.push(start.elapsed());
+        }
+        brute.sort();
+        pyr.sort();
+        println!("1 h summary, {cols} columns of {width} bins; median ms per repaint of 50\nbrute fold: {:?}\npyramid range: {:?}", brute[25], pyr[25]);
     }
 }
