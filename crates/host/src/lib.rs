@@ -13,6 +13,8 @@ use effectcraft_project::Footage;
 pub use effectcraft_script as script;
 
 pub mod app_dirs;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub mod malloc_tuning;
 
 struct MediaImporter;
 

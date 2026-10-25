@@ -139,11 +139,17 @@ fn install_file_dialogs(app: &mut EffectcraftApp, ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    let reexec = effectcraft_host::malloc_tuning::reexec();
     // First, so the panic hook and every start-up warning are recorded. Records go to stderr
     // and the session log; Help ▸ Enable Logging writes through this logger too, and warnings
     // feed the compatibility report.
     effectcraft_engine::logging::install();
     effectcraft_engine::logging::install_panic_hook();
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if let Err(e) = reexec {
+        log::warn!("huge-page malloc not enabled: {e}");
+    }
     let Args { control_port, files, demo, home } = match parse_args(std::env::args().skip(1), std::env::var("EFFECTCRAFT_CONTROL_PORT")) {
         Ok(Some(args)) => args,
         Ok(None) => {
