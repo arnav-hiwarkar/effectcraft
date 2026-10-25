@@ -1334,9 +1334,12 @@ fn paint_bucket(ctx: &EffectCtx, mut b: Buf) -> Buf {
 
 fn eyedropper_fill(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let pr = ctx.params;
+    let blend = (pr.f("blendWithOriginal") / 100.0) as f32;
+    if blend >= 1.0 {
+        return b;
+    }
     let fill = eyedropper_color(ctx, &b);
     let keep_alpha = pr.b("maintainOriginalAlpha");
-    let blend = (pr.f("blendWithOriginal") / 100.0) as f32;
     b.img.data.par_iter_mut().for_each(|px| {
         let a = if keep_alpha { px[3] } else { fill[3] };
         let f = premul([fill[0], fill[1], fill[2]], a);
@@ -1415,6 +1418,11 @@ pub fn eyedropper_color(ctx: &EffectCtx, b: &Buf) -> Px {
 
 fn threads(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let pr = ctx.params;
+    let coverage = (pr.f("coverage") / 100.0).clamp(0.0, 1.0);
+    if coverage <= 0.0 {
+        b.img.data.fill([0.0; 4]);
+        return b;
+    }
     let sc = b.scale;
     let tw = (pr.f("width") * sc).max(1.0);
     let th = (pr.f("height") * sc).max(1.0);
@@ -1422,7 +1430,6 @@ fn threads(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let ang = pr.f("direction").to_radians();
     let (sn, cs) = ang.sin_cos();
     let c = b.to_px(pr.v2("center"));
-    let coverage = (pr.f("coverage") / 100.0).clamp(0.0, 1.0);
     let shadow = (pr.f("shadowing") / 100.0) as f32;
     let texture = (pr.f("texture") / 100.0) as f32;
     let src = b.img.clone();
@@ -2338,6 +2345,32 @@ mod tests {
         assert!(out.img.data.iter().all(|p| *p == [1.0, 0.0, 0.0, 1.0]));
         let blended = run("ec.generate.eyedropperfill", &[("blendWithOriginal", num(100.0))], img.clone());
         assert_eq!(blended.img.data, img.data);
+    }
+
+    #[test]
+    fn eyedropper_fill_full_blend_identity() {
+        let mut img = Image::filled(16, 16, [0.2, 0.4, 0.6, 0.8]);
+        img.set(8, 8, [1.0, 0.0, 0.0, 1.0]);
+        for keep_alpha in [false, true] {
+            for blend in [100.0, 120.0] {
+                let out =
+                    run("ec.generate.eyedropperfill", &[("blendWithOriginal", num(blend)), ("maintainOriginalAlpha", Value::Bool(keep_alpha))], img.clone());
+                assert_eq!(out.img.data, img.data, "blend {blend}, keep_alpha {keep_alpha} must be bit-identical");
+            }
+        }
+        let zero = run("ec.generate.eyedropperfill", &[("blendWithOriginal", num(0.0))], img.clone());
+        assert_ne!(zero.img.data, img.data, "blend 0.0 must modify pixels to match sampled color");
+    }
+
+    #[test]
+    fn threads_zero_coverage_clears_in_place() {
+        let src = Image::filled(32, 32, [0.4, 0.6, 0.2, 1.0]);
+        for cov in [0.0, -10.0] {
+            let out = run("ec.generate.ccthreads", &[("coverage", num(cov))], src.clone());
+            assert!(out.img.data.iter().all(|p| *p == [0.0, 0.0, 0.0, 0.0]), "coverage {cov} must clear to transparent black");
+        }
+        let pos = run("ec.generate.ccthreads", &[("coverage", num(50.0))], src);
+        assert!(pos.img.data.iter().any(|p| *p != [0.0, 0.0, 0.0, 0.0]), "positive coverage must produce non-zero pixels");
     }
 
     #[test]
