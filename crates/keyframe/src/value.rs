@@ -357,6 +357,9 @@ impl Value {
                 let opacities = a.opacities.iter().zip(&b.opacities).map(|(x, y)| (x.0 + (y.0 - x.0) * t, x.1 + (y.1 - x.1) * t as f32)).collect();
                 Value::Gradient(Gradient { colors, opacities })
             }
+            // Two scalars interpolate to a scalar without the component vectors the generic
+            // numeric fallback below builds for them.
+            (Value::Scalar(a), Value::Scalar(b)) => Value::Scalar(a + (b - a) * t),
             _ if self.interpolates() && self.dims() > 0 && self.dims() == o.dims() => {
                 let a = self.components();
                 let b = o.components();
