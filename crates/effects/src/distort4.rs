@@ -368,7 +368,7 @@ fn liquify(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let pct = ctx.params.f("distortionPercentage") / 100.0;
     let show_freeze = ctx.params.b("viewFreezeAreaMask");
     let show_mesh = ctx.params.b("viewMesh");
-    if ctx.params.s("distortionMesh").trim().is_empty() && !show_freeze && !show_mesh {
+    if (ctx.params.s("distortionMesh").trim().is_empty() || pct == 0.0) && !show_freeze && !show_mesh {
         return b;
     }
     let mesh = liquify_mesh(ctx);
@@ -613,7 +613,7 @@ pub fn specs() -> Vec<EffectSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EffectEnv, EffectHost, LayerPixels, run_fx};
+    use crate::{EffectEnv, EffectHost, LayerPixels, MaskShape, run_fx};
 
     fn grid_img(w: u32, h: u32) -> Image {
         crate::util::gen_image(w, h, |x, y| {
@@ -718,6 +718,60 @@ mod tests {
             let m = build_mesh(&[s.clone(), st], 64.0, 64.0, &|_, _| false);
             assert!(m.d.iter().all(|d| d[0].is_finite() && d[1].is_finite()), "{}", LIQUIFY_TOOLS[t]);
         }
+    }
+
+    #[test]
+    fn liquify_neutral_distortion_percentage_skips_processing() {
+        let s = LiquifyStroke { tool: 0, size: 30.0, pressure: 80.0, jitter: 70.0, clone_offset: [0.0, 0.0], points: vec![[20.0, 32.0], [40.0, 32.0]] };
+        let img = grid_img(64, 64);
+
+        // 1. With non-empty distortionMesh and distortionPercentage = 100.0, pixel data is altered.
+        let out = run_fx(
+            "ec.distort.liquify",
+            &[("distortionMesh", Value::Str(s.to_line())), ("distortionPercentage", num(100.0))],
+            img.clone(),
+            0.0,
+            EffectEnv::default(),
+        );
+        assert_ne!(out.img.data, img.data);
+
+        // 2. With distortionPercentage = 0.0 and default overlay flags, output is bit-identical to input.
+        let zero = run_fx(
+            "ec.distort.liquify",
+            &[("distortionMesh", Value::Str(s.to_line())), ("distortionPercentage", num(0.0))],
+            img.clone(),
+            0.0,
+            EffectEnv::default(),
+        );
+        assert_eq!(zero.img.data, img.data);
+
+        // 3. With distortionPercentage = 0.0 but viewMesh = true, output is modified (overlay preserved).
+        let mesh_view = run_fx(
+            "ec.distort.liquify",
+            &[("distortionMesh", Value::Str(s.to_line())), ("distortionPercentage", num(0.0)), ("viewMesh", Value::Bool(true))],
+            img.clone(),
+            0.0,
+            EffectEnv::default(),
+        );
+        assert_ne!(mesh_view.img.data, img.data);
+
+        // 4. With distortionPercentage = 0.0, non-empty freeze mask, and viewFreezeAreaMask = true,
+        // output is modified (freeze overlay preserved).
+        let mask = MaskShape { points: vec![[16.0, 16.0], [48.0, 16.0], [48.0, 48.0], [16.0, 48.0]], closed: true, inverted: false, ..Default::default() };
+        let env = EffectEnv { masks: std::slice::from_ref(&mask), ..Default::default() };
+        let freeze_view = run_fx(
+            "ec.distort.liquify",
+            &[
+                ("distortionMesh", Value::Str(s.to_line())),
+                ("distortionPercentage", num(0.0)),
+                ("freezeAreaMask", num(1.0)),
+                ("viewFreezeAreaMask", Value::Bool(true)),
+            ],
+            img.clone(),
+            0.0,
+            env,
+        );
+        assert_ne!(freeze_view.img.data, img.data);
     }
 
     /// A textured frame panning right at 3 px per frame, captured with a rolling shutter: row
