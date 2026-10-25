@@ -297,6 +297,13 @@ pub fn ops_bench(spec: &LargeSpec, dir: &std::path::Path, fresh: &dyn Fn() -> Se
     let (ms, _) = time_best(3, || Project::from_json(&compact).expect("parse"));
     out.push(Measure { name: "openParseCompact", ms, note: format!("the same as compact JSON ({} MB, as auto-saves are written)", compact.len() / 1_000_000) });
     drop(compact);
+    // What a background job ships to the worker: the project as JSON. The worker parses either
+    // the same, so the compact form is the one to use (a background job starts with it).
+    let (ms, pretty) = time_best(3, || s.project.to_json());
+    out.push(Measure { name: "offloadSerialize", ms, note: format!("{} MB, pretty JSON", pretty.len() / 1_000_000) });
+    let (ms, compact) = time_best(3, || s.project.to_json_compact());
+    let smaller = if pretty.is_empty() { 0.0 } else { 100.0 * (1.0 - compact.len() as f64 / pretty.len() as f64) };
+    out.push(Measure { name: "offloadSerializeCompact", ms, note: format!("{} MB, compact JSON ({smaller:.0}% smaller)", compact.len() / 1_000_000) });
 
     // First frame of the main comp at 1/4 resolution (the viewer's first request).
     let cid = s.active_comp_id().expect("main comp");
