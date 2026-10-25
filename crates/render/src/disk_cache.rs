@@ -430,7 +430,10 @@ impl DiskCache {
         }
     }
 
-    fn read(&self, kind: Kind, key: u128) -> Option<Vec<u8>> {
+    /// Read an entry and hand the verified payload to `f` without a second copy; the counters,
+    /// the touch and the corrupt-file removal are `read`'s, the decoding is the caller's (`None`
+    /// from the closure is still a hit).
+    fn read<T>(&self, kind: Kind, key: u128, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
         if !self.contains(kind, key) {
             self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -440,7 +443,7 @@ impl DiskCache {
         let ok = data.as_deref().and_then(|d| verify(d, kind));
         match ok {
             Some(payload) => {
-                let payload = payload.to_vec();
+                let out = f(payload);
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 if let Ok(mut g) = self.index.lock() {
                     g.touch(kind, key);
@@ -449,7 +452,7 @@ impl DiskCache {
                 if let Ok(f) = std::fs::File::options().append(true).open(&path) {
                     let _ = f.set_modified(std::time::SystemTime::now());
                 }
-                Some(payload)
+                Some(out)
             }
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
@@ -531,8 +534,7 @@ impl DiskCache {
     // ------------------------------------------------------------ typed entries
 
     pub fn get_frame(&self, key: u128) -> Option<Frame8> {
-        let p = self.read(Kind::Frame, key)?;
-        decode_frame(&p)
+        self.read(Kind::Frame, key, decode_frame).flatten()
     }
 
     /// Queue a frame for writing (8-bit premultiplied RGBA, `width * height * 4` bytes).
@@ -544,8 +546,7 @@ impl DiskCache {
     }
 
     pub fn get_layer(&self, key: u128) -> Option<Buf> {
-        let p = self.read(Kind::Layer, key)?;
-        decode_layer(&p)
+        self.read(Kind::Layer, key, decode_layer).flatten()
     }
 
     /// Queue a layer buffer for writing.
@@ -563,9 +564,10 @@ impl DiskCache {
 
     /// A segmentation (chain key, scale) written by [`DiskCache::put_seg`].
     pub fn get_seg(&self, key: u64, scale: f64) -> Option<effectcraft_effects::roto::FrameSeg> {
-        let p = self.read(Kind::Matte, seg_key(key, scale))?;
-        let raw = lz4_flex::decompress_size_prepended(&p).ok()?;
-        effectcraft_effects::roto::FrameSeg::from_bytes(&raw)
+        self.read(Kind::Matte, seg_key(key, scale), |p| {
+            lz4_flex::decompress_size_prepended(p).ok().and_then(|raw| effectcraft_effects::roto::FrameSeg::from_bytes(&raw))
+        })
+        .flatten()
     }
 
     /// Queue a segmentation for writing.
@@ -1073,6 +1075,46 @@ mod tests {
         assert!(dc.get_frame(5).is_none());
         assert!(!dc.contains(Kind::Frame, 5));
         assert!(!p.exists());
+    }
+
+    /// A verified payload reaches the closure without a second copy (frame, layer and seg
+    /// entries round-trip and count as hits), a corrupt file is still removed and counted as a
+    /// miss, and a validly sealed but undecodable payload is still a hit with the file kept.
+    #[test]
+    fn read_closure_roundtrips_and_corrupt_still_removed() {
+        use effectcraft_effects::roto::FrameSeg;
+        let dir = tmpdir("closure");
+        let dc = DiskCache::open(&dir, 1 << 30).unwrap();
+        let rgba: Vec<u8> = (0..9 * 5 * 4).map(|i| (i % 253) as u8).collect();
+        dc.put_frame_now(1, 9, 5, &rgba);
+        let b = buf(2, 11, 6);
+        dc.put_layer_now(2, &b);
+        let seg = FrameSeg { w: 7, h: 5, matte: (0..35).map(|i| (i % 3 == 0) as u8).collect(), refine: vec![0; 35], ..Default::default() };
+        dc.put_seg(3, 1.0, &seg);
+        dc.flush();
+        assert_eq!(dc.get_frame(1).map(|f| f.rgba), Some(rgba.clone()));
+        let back = dc.get_layer(2).unwrap();
+        assert_eq!(back.img, b.img);
+        assert_eq!((back.offset, back.scale), (b.offset, b.scale));
+        assert_eq!(dc.get_seg(3, 1.0).as_ref(), Some(&seg));
+        let st = dc.stats();
+        assert_eq!((st.hits, st.misses, st.writes), (3, 0, 3));
+        // Corrupt on disk: a miss, and the entry is removed.
+        let path = dc.path(Kind::Frame, 1);
+        let mut d = std::fs::read(&path).unwrap();
+        let n = d.len();
+        d[n / 2] ^= 0xff;
+        std::fs::write(&path, d).unwrap();
+        assert!(dc.get_frame(1).is_none());
+        assert!(!dc.contains(Kind::Frame, 1) && !path.exists());
+        // Validly sealed but undecodable (an empty payload): still a hit, file kept.
+        dc.write_now(Kind::Frame, 4, &[]);
+        assert!(dc.contains(Kind::Frame, 4));
+        assert!(dc.get_frame(4).is_none());
+        assert!(dc.contains(Kind::Frame, 4) && dc.path(Kind::Frame, 4).exists());
+        let st = dc.stats();
+        assert_eq!((st.hits, st.misses), (4, 1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
