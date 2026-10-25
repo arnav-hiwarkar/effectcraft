@@ -20,6 +20,8 @@
 //! profiles, and from the shared separable Gaussian (`effects::util::gauss_plane`) for soft
 //! shadows and glows. All per-pixel work is parallel (rayon).
 
+use std::borrow::Cow;
+
 use effectcraft_color::{BlendMode, blend_pixel};
 use effectcraft_effects::Buf;
 use effectcraft_effects::util::{Plane, gauss_plane};
@@ -432,14 +434,14 @@ fn soft_shape(alpha: &Plane, d: &Lazy, size: f64, spread: f64, inverse: bool) ->
     let base = if hard > 0.01 {
         let sd = d.get(alpha);
         let r = hard as f32;
-        if inverse { sd.map(|v| grown(-v, r)) } else { sd.map(|v| grown(v, r)) }
+        Cow::Owned(if inverse { sd.map(|v| grown(-v, r)) } else { sd.map(|v| grown(v, r)) })
     } else if inverse {
-        alpha.map(|a| 1.0 - a)
+        Cow::Owned(alpha.map(|a| 1.0 - a))
     } else {
-        alpha.clone()
+        Cow::Borrowed(alpha)
     };
     let sigma = (size - hard).max(0.0) / 2.0;
-    if sigma > 0.05 { gauss_plane(&base, sigma, sigma) } else { base }
+    if sigma > 0.05 { gauss_plane(base.as_ref(), sigma, sigma) } else { base.into_owned() }
 }
 
 /// Bilinear read of `p` displaced by `off` pixels (the plane moves by `off`).
@@ -762,4 +764,67 @@ fn bevel(body: &mut Image, alpha: &Plane, d: &Lazy, bv: &Bevel, s: f64, seed: u3
         let (hl, _) = shade(x, y);
         (bv.hl.1, hl * bv.hl.2 * region(y * w + x))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::OnceLock;
+
+    /// Reference copy of the original `soft_shape` (alpha cloned before the blur path).
+    fn soft_shape_legacy(alpha: &Plane, d: &Lazy, size: f64, spread: f64, inverse: bool) -> Plane {
+        let hard = size * spread;
+        let base = if hard > 0.01 {
+            let sd = d.get(alpha);
+            let r = hard as f32;
+            if inverse { sd.map(|v| grown(-v, r)) } else { sd.map(|v| grown(v, r)) }
+        } else if inverse {
+            alpha.map(|a| 1.0 - a)
+        } else {
+            alpha.clone()
+        };
+        let sigma = (size - hard).max(0.0) / 2.0;
+        if sigma > 0.05 { gauss_plane(&base, sigma, sigma) } else { base }
+    }
+
+    fn assert_same(a: &Plane, b: &Plane) {
+        assert_eq!((a.w, a.h), (b.w, b.h));
+        for (x, y) in a.data.iter().zip(&b.data) {
+            assert_eq!(x.to_bits(), y.to_bits());
+        }
+    }
+
+    #[test]
+    fn soft_shape_matches_legacy_coverage() {
+        let sizes = [0.0, 0.1, 0.1000001, 2.0, 5.0];
+        let spreads = [0.0, 0.005, 0.5, 1.0];
+        let filled = Plane { w: 3, h: 2, data: vec![0.0, 0.25, 1.0, 0.75, 0.5, 0.0] };
+        let empty_0x0 = Plane::new(0, 0);
+        let empty_3x0 = Plane::new(3, 0);
+        let empty_0x2 = Plane::new(0, 2);
+        for alpha in [&filled, &empty_0x0, &empty_3x0, &empty_0x2] {
+            let d = Lazy(OnceLock::new());
+            for &size in &sizes {
+                for &spread in &spreads {
+                    for inverse in [false, true] {
+                        let got = soft_shape(alpha, &d, size, spread, inverse);
+                        let want = soft_shape_legacy(alpha, &d, size, spread, inverse);
+                        assert_same(&got, &want);
+                    }
+                }
+            }
+        }
+        // Zero size: the returned plane owns the unchanged alpha (or its inverse).
+        let d = Lazy(OnceLock::new());
+        let mut source = filled.clone();
+        let unblurred = soft_shape(&source, &d, 0.0, 1.0, false);
+        // Changing the source afterwards leaves the result untouched: it owns its own copy.
+        for v in source.data.iter_mut() {
+            *v = 0.5;
+        }
+        assert_eq!((unblurred.w, unblurred.h), (3, 2));
+        assert_eq!(unblurred.data, [0.0, 0.25, 1.0, 0.75, 0.5, 0.0]);
+        let inverted = soft_shape(&filled, &d, 0.0, 1.0, true);
+        assert_eq!(inverted.data, [1.0, 0.75, 0.0, 0.25, 0.5, 1.0]);
+    }
 }
