@@ -123,6 +123,10 @@ pub(crate) struct Pool {
 pub(crate) static TEXTURE_REUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Counts of uploads (CPU → GPU) and readbacks (GPU → CPU).
+///
+/// A readback counts the copy that was submitted to the GPU, with its packed bytes (row padding
+/// excluded), not the callback that later delivered them: a copy whose mapping fails afterwards
+/// was still transferred. A request that is rejected before the copy is recorded counts nothing.
 #[derive(Default)]
 pub(crate) struct Transfers {
     ups: std::sync::atomic::AtomicU64,
@@ -1357,6 +1361,9 @@ impl<'g> Enc<'g> {
     /// [`Enc::read_texture`] without waiting for the GPU (the browser's main thread can't): `done`
     /// gets the bytes once the copy is mapped (from the browser's event loop on the web; from
     /// a later device poll natively).
+    ///
+    /// The submitted copy counts as a readback in [`GpuContext::transfer_stats`], whether or not
+    /// its mapping later succeeds.
     pub fn read_texture_async(&mut self, texture: &wgpu::Texture, w: u32, h: u32, bpp: u32, done: impl FnOnce(Option<Vec<u8>>) + wgpu::WasmNotSend + 'static) {
         if let Err(e) = self.g.readbacks.check() {
             log::error!("gpu readback: {e}");
@@ -1384,6 +1391,9 @@ impl<'g> Enc<'g> {
             wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) } },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
+        // The copy is about to be submitted: count it as a readback (its packed bytes, without
+        // the row padding the copy carries), whether or not the mapping that follows succeeds.
+        self.g.transfers.count(false, layout.len);
         self.submit();
         self.g.map_readback(&buf, row as usize, padded as usize, h as usize, move |r| {
             done(r.map_err(|e| log::error!("gpu texture readback: {e}")).ok());
@@ -1402,7 +1412,8 @@ impl<'g> Enc<'g> {
             Lookup::Ready(r) => return Some(r),
             Lookup::InFlight => {}
             Lookup::Absent => {
-                self.g.transfers.count(false, img.width as usize * img.height as usize * 16);
+                // The readback is counted by `read_texture_async`, once the copy is submitted with
+                // its validated layout (a request rejected before that counts nothing).
                 let done = d.start(key, img.width, img.height, offset, scale);
                 self.read_texture_async(&img.texture, img.width, img.height, 16, done);
             }
@@ -1554,5 +1565,63 @@ mod adapter_name_tests {
     fn no_adapters_has_its_own_message() {
         let e = match_adapter_name("x", &[]).unwrap_err();
         assert!(e.contains("no adapters on the enabled backends"), "{e}");
+    }
+}
+
+/// The transfer statistics count the async copies that are submitted, and only those.
+#[cfg(test)]
+mod async_transfer_stats_tests {
+    use super::{Enc, FORMAT, GpuContext};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// A 1×1 RGBA f32 texture to read back (the driver zeroes it).
+    fn one_pixel(ctx: &GpuContext) -> wgpu::Texture {
+        ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("async-transfer-test"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FORMAT,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    }
+
+    #[test]
+    fn async_readback_counts_only_submitted_copy() {
+        let Some(g) = crate::tests::gpu() else { return };
+        let ctx: &GpuContext = &g.ctx;
+        let texture = one_pixel(ctx);
+        let mut enc = Enc::new(ctx);
+
+        // A request the layout rejects copies nothing, so it must not be counted.
+        let before = ctx.transfer_stats();
+        let (rejected_tx, rejected_rx) = mpsc::channel();
+        enc.read_texture_async(&texture, 1, 0, 16, move |pixels| {
+            let _ = rejected_tx.send(pixels);
+        });
+        assert_eq!(rejected_rx.recv_timeout(Duration::from_secs(2)).expect("the rejected request settles"), None);
+        let rejected = ctx.transfer_stats();
+        assert_eq!(
+            (rejected.readbacks, rejected.readback_bytes),
+            (before.readbacks, before.readback_bytes),
+            "a rejected request must not change the readback statistics"
+        );
+
+        // A submitted copy counts once, with its packed bytes (16 for one RGBA f32 pixel).
+        let base = ctx.transfer_stats();
+        let (tx, rx) = mpsc::channel();
+        enc.read_texture_async(&texture, 1, 1, 16, move |pixels| {
+            let _ = tx.send(pixels);
+        });
+        let after = ctx.transfer_stats();
+        assert_eq!(after.readbacks - base.readbacks, 1, "the submitted copy counts once");
+        assert_eq!(after.readback_bytes - base.readback_bytes, 16, "its packed bytes are counted");
+        ctx.poll_readbacks(wgpu::PollType::Wait { submission_index: None, timeout: Some(Duration::from_secs(2)) })
+            .expect("polling the device for the readback");
+        let pixels = rx.recv_timeout(Duration::from_secs(2)).expect("the readback settles");
+        assert_eq!(pixels, Some(vec![0u8; 16]), "the readback returns the pixel's zero bytes");
     }
 }
