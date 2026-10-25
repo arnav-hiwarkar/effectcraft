@@ -164,12 +164,18 @@ fn set_texture(
         (FrameImage::Cpu(img), Some((_, PassiveTexture::Cpu(mut h))))
             if h.size() == crate::frames::fitted_size(img.size, crate::frames::max_texture_side(ctx)) =>
         {
-            h.set(crate::frames::fit_texture((*img).clone(), crate::frames::max_texture_side(ctx)), opts);
+            // The frame is uploaded as it is: copying it first (a whole 4K frame, every frame a
+            // passive viewer shows) held the UI thread for about a millisecond each time.
+            h.set(crate::frames::fit_shared_texture_by(&img, crate::frames::max_texture_side(ctx), 1), opts);
             PassiveTexture::Cpu(h)
         }
         (FrameImage::Cpu(img), old) => {
             free(app, old.map(|(_, t)| t));
-            PassiveTexture::Cpu(crate::frames::load_fitted(ctx, format!("viewer-{id}"), (*img).clone(), opts))
+            PassiveTexture::Cpu(ctx.load_texture(
+                format!("viewer-{id}"),
+                crate::frames::fit_shared_texture_by(&img, crate::frames::max_texture_side(ctx), 1),
+                opts,
+            ))
         }
         (FrameImage::Gpu(f), old) => {
             let Some(rs) = &app.wgpu else { return };
@@ -298,4 +304,68 @@ pub fn on_close(app: &mut EffectcraftApp, p: PanelKind) {
 pub fn title(app: &EffectcraftApp, id: u32) -> Option<String> {
     let c = comp_of(app, id)?;
     Some(format!("{} {}", crate::i18n::command_label("window.panel", "Composition"), app.session.project.item(c)?.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The texture a passive viewer shows.
+    fn texture_id(app: &EffectcraftApp, id: u32) -> egui::TextureId {
+        match app.passive_tex.get(&id) {
+            Some((_, PassiveTexture::Cpu(h))) => h.id(),
+            _ => panic!("the passive viewer has no CPU texture"),
+        }
+    }
+
+    /// The image a texture was uploaded with. Its other deltas are cleared: dropping a
+    /// `TexturesDelta` with unapplied deltas panics.
+    fn uploaded(mut out: egui::FullOutput, tex: egui::TextureId) -> Arc<egui::ColorImage> {
+        let delta = out.textures_delta.set.get(&tex).and_then(|d| d.first()).expect("the viewer's texture was uploaded");
+        let egui::ImageData::Color(img) = &delta.image;
+        let img = img.clone();
+        out.textures_delta.clear();
+        img
+    }
+
+    /// A passive viewer uploads the frame it shows instead of copying it (#54): copying a 4K
+    /// frame held the UI thread for about a millisecond, for every passive viewer, every frame.
+    #[test]
+    fn passive_viewer_uploads_the_frame_instead_of_copying_it() {
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        let ctx = egui::Context::default();
+        // The first frame gives the context its input (the renderer's texture limit). Its font
+        // atlas upload is not checked here.
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+        let key = FrameKey { revision: 0, content: 1, comp: 1, frame: 0, scale: 1000, view: 0, opts: 0 };
+
+        // A new texture: the frame is uploaded as it is.
+        let first = Arc::new(egui::ColorImage::new([16, 16], vec![egui::Color32::WHITE; 256]));
+        set_texture(&mut app, &ctx, 1, key, FrameImage::Cpu(first.clone()), None, 0);
+        let tex = texture_id(&app, 1);
+        let out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        assert!(Arc::ptr_eq(&uploaded(out, tex), &first), "the passive viewer must upload the frame it shows");
+
+        // The next frame of the same size: the texture is reused, and still holds the frame.
+        let second = Arc::new(egui::ColorImage::new([16, 16], vec![egui::Color32::WHITE; 256]));
+        set_texture(&mut app, &ctx, 1, FrameKey { frame: 1, ..key }, FrameImage::Cpu(second.clone()), None, 0);
+        let out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        assert_eq!(texture_id(&app, 1), tex, "the texture of the same size is reused");
+        assert!(Arc::ptr_eq(&uploaded(out, tex), &second), "the reused texture must hold the frame it shows");
+
+        // A frame wider than the texture limit (2048) is averaged down, as it was before.
+        let wide = Arc::new(egui::ColorImage::new([4096, 64], vec![egui::Color32::WHITE; 4096 * 64]));
+        set_texture(&mut app, &ctx, 1, FrameKey { frame: 2, ..key }, FrameImage::Cpu(wide.clone()), None, 0);
+        let fitted = texture_id(&app, 1);
+        let out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let image = uploaded(out, fitted);
+        assert_eq!(image.size, [2048, 32]);
+        assert!(!Arc::ptr_eq(&image, &wide), "a frame over the texture limit is averaged down, not shared");
+        assert_eq!(image.pixels, vec![egui::Color32::WHITE; 2048 * 32]);
+
+        // Free the viewer's texture and flush the free: the texture manager panics when it is
+        // dropped with unapplied deltas.
+        app.passive_tex.clear();
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+    }
 }
