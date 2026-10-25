@@ -256,12 +256,26 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
         Channels::Rgba if !matches!(fmt, OutputFormat::ProRes | OutputFormat::Uncompressed) => Channels::Rgb,
         c => c,
     };
-    let mut venc: Box<dyn VideoEncoder> = match fmt {
+    let venc: Box<dyn VideoEncoder> = match fmt {
         OutputFormat::H264 => Box::new(H264::new(w, h, rate, job.output.bitrate_kbps)?),
         OutputFormat::Hevc => Box::new(crate::hevc_av1::Hevc::new(w, h, rate, job.output)?),
         OutputFormat::Av1 => Box::new(crate::hevc_av1::Av1::new(w, h, rate, job.output)?),
         OutputFormat::Uncompressed => Box::new(crate::uncompressed::Raw::new(w, h, channels == Channels::Rgba)?),
         _ => Box::new(ProRes::new(w, h, job.output.prores_profile, if channels == Channels::Alpha { Channels::Rgb } else { channels })),
+    };
+    movie_with_encoder(job, comp, w, h, st, venc).await
+}
+
+/// The movie export with the encoder already chosen: the tracks, the frames and the file.
+///
+/// When a later frame fails to encode, the file is finalised anyway, so the samples already
+/// written keep their index (`moov`); the encoder's own error is what the export reports.
+async fn movie_with_encoder(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_>, mut venc: Box<dyn VideoEncoder>) -> Result<Report> {
+    let rate = job.settings.rate(comp);
+    let fmt = job.output.format;
+    let channels = match job.output.channels {
+        Channels::Rgba if !matches!(fmt, OutputFormat::ProRes | OutputFormat::Uncompressed) => Channels::Rgb,
+        c => c,
     };
     let brand = if matches!(fmt, OutputFormat::ProRes | OutputFormat::Uncompressed) { Brand::Mov } else { Brand::Mp4 };
     let batch = batch_size();
@@ -360,7 +374,18 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
         let end = (i + batch).min(total);
         let frames: Vec<Vec<u8>> = job.frames(comp, (i..end).collect(), render).await;
         for (k, px) in frames.iter().enumerate() {
-            let ps = venc.encode(px, i + k as u64)?;
+            let ps = match venc.encode(px, i + k as u64) {
+                Ok(ps) => ps,
+                Err(e) => {
+                    // The samples already written still need their index: finalise the file, so
+                    // what was encoded stays readable. The encoder's error is what is reported.
+                    let finalised = mux.finish().map_err(mux_err).and_then(|out| out.flush().map_err(mux_err));
+                    if let Err(secondary) = finalised {
+                        log::warn!(target: "effectcraft_export", "could not finalise {path} after the encoder failed: {secondary}");
+                    }
+                    return Err(e);
+                }
+            };
             write_video(&mut mux, ps)?;
         }
         write_audio_until(&mut mux, frame_end_time(end), &mut cursor)?;
@@ -383,6 +408,97 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::uncompressed::Raw;
+    use effectcraft_color::Label;
+    use effectcraft_project::render_queue::{AudioOutput, OutputModule, RenderSettings, TimeSpan};
+    use effectcraft_project::{ItemKind, Project};
+    use effectcraft_render::NoFootage;
+    use web_time::Instant;
+
+    /// The uncompressed encoder with one frame failing, to exercise the recovery path.
+    struct FailsAt {
+        inner: Raw,
+        fail_at: u64,
+    }
+
+    impl VideoEncoder for FailsAt {
+        fn sample_entry(&self) -> SampleEntry {
+            self.inner.sample_entry()
+        }
+        fn encode(&mut self, rgba: &[u8], index: u64) -> Result<Vec<Packet>> {
+            if index == self.fail_at {
+                return Err(ExportError::Encode("injected frame failure".into()));
+            }
+            self.inner.encode(rgba, index)
+        }
+        fn flush(&mut self) -> Result<Vec<Packet>> {
+            self.inner.flush()
+        }
+    }
+
+    /// A later encoder error still finalises the file: the frames written before it keep their
+    /// index and stay readable, and the encoder's own error is what the export reports.
+    #[test]
+    fn movie_encode_failure_finalizes_completed_samples() {
+        let dir = std::env::temp_dir().join(format!(
+            "effectcraft-export-21b-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("comp.mov");
+
+        let mut p = Project::default();
+        let comp = Comp::new(2, 2, FrameRate::new(1, 1), Tick::from_seconds_f64(4.0));
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+        let settings = RenderSettings { time_span: TimeSpan::LengthOfComp, ..Default::default() };
+        let output = OutputModule { channels: Channels::Rgb, audio: AudioOutput::Off, ..OutputModule::for_format(OutputFormat::Uncompressed) };
+        let path_str = path.to_string_lossy().to_string();
+        let job = crate::Job {
+            project: &p,
+            footage: &NoFootage,
+            expr: None,
+            accel: None,
+            comp: cid,
+            settings: &settings,
+            output: &output,
+            path: &path_str,
+            sink: None,
+            nested_switches: true,
+            options: Default::default(),
+        };
+
+        // One thread: a batch is two frames, so the third frame fails in the later loop.
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let result = pool.install(|| {
+            let cx = Cx::new(&job);
+            let comp = cx.comp().unwrap();
+            let mut progress = |_: &crate::Progress| true;
+            let mut st = State { t0: Instant::now(), total: 4, done: 0, progress: &mut progress };
+            effectcraft_render::passes::block_on(movie_with_encoder(
+                &cx,
+                comp,
+                2,
+                2,
+                &mut st,
+                Box::new(FailsAt { inner: Raw::new(2, 2, false).unwrap(), fail_at: 2 }),
+            ))
+        });
+
+        match result {
+            Err(ExportError::Encode(msg)) => assert_eq!(msg, "injected frame failure"),
+            other => panic!("expected the encoder error, got {other:?}"),
+        }
+
+        let bytes = std::fs::read(&path).unwrap();
+        let mov = filmcraft_isobmff::open(bytes.as_slice()).unwrap();
+        let t = mov.tracks.iter().find(|t| t.kind == filmcraft_isobmff::TrackKind::Video).expect("video track");
+        assert_eq!(t.samples.len(), 2, "the frames written before the failure");
+        for s in &t.samples {
+            assert_eq!(&bytes[s.offset as usize..][..s.size as usize], &[0u8; 12], "one black 2×2 frame");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn yuv_of_primaries() {
