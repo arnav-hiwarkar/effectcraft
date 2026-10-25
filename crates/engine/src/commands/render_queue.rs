@@ -671,12 +671,10 @@ fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
 fn render(s: &mut Session, p: &Value) -> Result<Value> {
     let wait = b_p(p, "wait").unwrap_or(true);
     // Settings ▸ Project ▸ Auto-Save ▸ Save When Starting Render Queue.
-    if s.prefs.auto_save.enabled
-        && s.prefs.auto_save.save_on_render_start
-        && s.is_dirty()
-        && let Err(e) = s.autosave_now()
-    {
-        log::warn!("{e}");
+    if s.prefs.auto_save.enabled && s.prefs.auto_save.save_on_render_start && s.is_dirty() {
+        s.autosave_now()
+            .and_then(|_| s.autosave_wait())
+            .map_err(|e| EngineError::Other(format!("Render not started: {e}. Check the auto-save folder and available disk space, then retry.")))?;
     }
     let ids = s.start_render(wait).map_err(EngineError::Other)?;
     let items: Vec<Value> = s.project.render_queue.iter().enumerate().filter(|(_, i)| ids.contains(&i.id)).map(|(k, i)| item_json(s, i, k)).collect();
