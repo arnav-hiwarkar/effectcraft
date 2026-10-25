@@ -139,6 +139,10 @@ fn jaws(ctx: &EffectCtx, mut b: Buf) -> Buf {
     if c <= 0.0 {
         return b;
     }
+    if c >= 1.0 {
+        b.img.data.fill([0.0; 4]);
+        return b;
+    }
     let s = b.scale;
     let (cx, cy) = b.to_px(ctx.params.v2("center"));
     let ang = ctx.params.f("direction").to_radians();
@@ -198,6 +202,10 @@ fn jaws(ctx: &EffectCtx, mut b: Buf) -> Buf {
 fn line_sweep(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let c = completion(ctx) as f64;
     if c <= 0.0 {
+        return b;
+    }
+    if c >= 1.0 {
+        b.img.data.fill([0.0; 4]);
         return b;
     }
     let s = b.scale;
@@ -540,5 +548,33 @@ mod tests {
         // Red ramps left→right: dark (left) side goes first.
         assert!(o.img.data[16 * 40 + 2][3] < 0.01);
         assert!(o.img.data[16 * 40 + 37][3] > 0.99);
+    }
+
+    #[test]
+    fn jaws_and_line_sweep_full_completion_clears_in_place() {
+        let img = ramp(40, 32);
+        for id in ["ec.transition.ccjaws", "ec.transition.cclinesweep"] {
+            let mut v0 = centre(id);
+            v0.push(("completion", num(0.0)));
+            let o0 = run(id, &v0, img.clone());
+            assert_eq!(o0.img.data, img.data, "{id} at 0.0");
+
+            let mut v50 = centre(id);
+            v50.push(("completion", num(50.0)));
+            let o50 = run(id, &v50, img.clone());
+            let opaque = o50.img.data.iter().filter(|p| p[3] > 0.99).count();
+            let clear = o50.img.data.iter().filter(|p| p[3] < 0.01).count();
+            assert!(opaque > 0 && clear > 0, "{id} at 50.0: opaque={opaque} clear={clear}");
+
+            let mut v100 = centre(id);
+            v100.push(("completion", num(100.0)));
+            let o100 = run(id, &v100, img.clone());
+            assert!(o100.img.data.iter().all(|&p| p == [0.0; 4]), "{id} at 100.0");
+
+            let mut v120 = centre(id);
+            v120.push(("completion", num(120.0)));
+            let o120 = run(id, &v120, img.clone());
+            assert!(o120.img.data.iter().all(|&p| p == [0.0; 4]), "{id} at 120.0");
+        }
     }
 }
