@@ -249,7 +249,7 @@ fn cc_power_pin(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let persp = (ctx.params.f("perspective") / 100.0).clamp(0.0, 1.0);
     let fwd = Mat3::square_to_quad(q);
     let Some(inv) = fwd.inverse() else { return b };
-    let src = b.img.clone();
+    let src = std::mem::take(&mut b.img);
     let (sc, off) = (b.scale, b.offset);
     let bil = move |u: f64, v: f64| -> (f64, f64) {
         let top = (q[0].x + (q[1].x - q[0].x) * u, q[0].y + (q[1].y - q[0].y) * u);
@@ -1335,6 +1335,20 @@ mod tests {
         // Default corners are the identity either way.
         let id = run("ec.distort.ccpowerpin", &[("unstretch", Value::Bool(true))], im.clone(), &[]);
         assert!(maxd(&id.img, &im) < 1e-4);
+    }
+
+    #[test]
+    fn power_pin_avoids_redundant_clone_and_handles_empty_image() {
+        let empty = Image::new(0, 0);
+        let out_empty = run("ec.distort.ccpowerpin", &[], empty, &[]);
+        assert_eq!((out_empty.img.width, out_empty.img.height), (0, 0));
+        assert!(out_empty.img.data.is_empty());
+
+        let im = img(30, 20);
+        let out = run("ec.distort.ccpowerpin", &[("topLeft", pt(5.0, 2.0))], im.clone(), &[]);
+        assert_eq!((out.img.width, out.img.height), (im.width, im.height));
+        assert_eq!(out.img.data.len(), 30 * 20);
+        assert!(out.img.data.iter().any(|p| p[3] > 0.0));
     }
 
     #[test]
