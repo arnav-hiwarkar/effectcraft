@@ -160,3 +160,40 @@ fn auto_pick_follows_changing_costs() {
     assert!(pick.stats(AutoKey::new(ItemId(7), 1.0, true)).is_none());
     assert!(pick.stats(AutoKey::new(ItemId(7), 0.5, false)).is_none());
 }
+
+/// Backend::Auto frames the CPU compositor draws (GPU acceleration off, or the accelerator
+/// declines) skip the layers under an opaque full-frame solid, with the same pixels.
+#[test]
+fn auto_cpu_frames_cull_occluded_layers() {
+    for gpu in [false, true] {
+        let mut p = Project::default();
+        p.settings.gpu_acceleration = gpu;
+        let mut comp = Comp::new(200, 100, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let mut layers = Vec::new();
+        for (name, color) in [("Top", [0.0, 1.0, 0.0]), ("Below", [1.0, 0.0, 0.0])] {
+            let sid = p.add_item(name, Label::Red, None, ItemKind::Solid(Solid { color, width: 200, height: 100, pixel_aspect: 1.0 }));
+            layers.push(build::layer(&mut p, &comp, name, LayerSource::Solid { item: sid }, (200, 100), None));
+        }
+        comp.layers = layers;
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+        let a = TimedAccel::new(0, false);
+        let log = std::sync::Mutex::new(Vec::new());
+        let img = {
+            let mut r = Renderer::new(&p, &NoFootage, RenderOpts { backend: Backend::Auto, ..Default::default() });
+            r.accel = Some(&a);
+            r.profile = Some(&log);
+            r.comp_frame(cid, Tick::ZERO)
+        };
+        let drawn: Vec<String> = log.into_inner().unwrap().into_iter().map(|t| t.layer).collect();
+        assert_eq!(drawn, vec!["Top".to_string()], "gpu_acceleration = {gpu}");
+        assert_eq!(a.calls(), usize::from(gpu));
+        // A full-frame region of interest never culls.
+        let roi = RenderOpts { backend: Backend::Auto, roi: Some([0.0, 0.0, 200.0, 100.0]), ..Default::default() };
+        let reference = Renderer::new(&p, &NoFootage, roi).comp_frame(cid, Tick::ZERO);
+        assert_eq!((img.width, img.height), (reference.width, reference.height));
+        for (x, y) in img.data.iter().zip(&reference.data) {
+            assert_eq!(x.map(f32::to_bits), y.map(f32::to_bits));
+        }
+        assert_eq!(img.get(0, 0), [0.0, 1.0, 0.0, 1.0]);
+    }
+}
