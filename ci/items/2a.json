@@ -1,0 +1,12 @@
+{
+ "id": "2a",
+ "source_head": "9e0a42a251a7440e11512daf9b18963e32468590",
+ "github_branch": "perf/2a",
+ "focus": "draft",
+ "named_filters": [
+  {
+   "package": "effectcraft-gpu",
+   "test": "released_cap_tests"
+  }
+ ]
+}

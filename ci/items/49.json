@@ -1,0 +1,16 @@
+{
+ "id": "49",
+ "source_head": "2865051df332bea97b69672a259004a598b98057",
+ "github_branch": "perf/49",
+ "focus": "draft",
+ "named_filters": [
+  {
+   "package": "effectcraft-render",
+   "test": "input_key"
+  },
+  {
+   "package": "effectcraft-render",
+   "test": "layer_dependencies_remain_cacheable"
+  }
+ ]
+}

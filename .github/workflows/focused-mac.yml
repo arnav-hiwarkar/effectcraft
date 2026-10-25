@@ -1,0 +1,99 @@
+name: focused-mac-ci
+# Supplemental, focused macOS CI for migration source heads that cannot run the
+# standard merge gate (merge conflicts / pending validation). Lives ONLY on
+# branch perf/ci-migration, is triggered by pushes to that branch only, and
+# never gates, publishes or merges main. It runs focused `cargo test` subsets
+# and reports honest results only: no GPU/UI/criterion benchmarks and no
+# performance acceptance, not a replacement for the standard PR gate.
+on:
+  push:
+    branches: [perf/ci-migration]
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: focused-mac-ci-${{ github.ref }}
+  cancel-in-progress: true # a newer push to this branch cancels its older runs
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      count: ${{ steps.gen.outputs.count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1 # matrix job reads only item JSON files
+      - id: gen
+        run: python3 ci/gen_matrix.py ci/items >> "$GITHUB_OUTPUT"
+
+  tests:
+    needs: matrix
+    if: needs.matrix.outputs.count != '0' # nothing pending -> nothing runs
+    runs-on: macos-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
+    steps:
+      # Full history (fetch-depth: 0): the verified merge-base -- main diff
+      # needs ancestor commits; no partial/shallow shortcut is allowed.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12" # runner needs tomllib (3.11+) for manifest parse
+      - name: Ensure stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo --version
+      # Registry-only cache, keyed by host OS only on purpose: no lockfile hash
+      # (each tested SHA may carry its own lock) and NO target dir, so item
+      # sources are always compiled fresh and no foreign head's test binary is
+      # ever reused. Details in ci/README.md.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: focused-mac-registry-${{ runner.os }}
+      - name: Run focused libtests for item ${{ matrix.id }} at ${{ matrix.head }}
+        env:
+          CARGO_BUILD_JOBS: "2" # shared Mac runners: cap concurrent cargo build jobs
+        run: python3 ci/runner.py --item ${{ matrix.item }} --out ci-out
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: focused-mac-logs-${{ matrix.id }}
+          path: ci-out/
+          if-no-files-found: ignore
+      # Commit status on the exact tested SHA. GH_TOKEN is present in THIS step
+      # only (workflow grants statuses:write + contents:read). Commit statuses
+      # have no neutral state, so a neutral result is reported as "failure"
+      # with an honest description — never a fake pass.
+      - name: Report commit status (focused-mac-ci)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ matrix.head }}
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          p=ci-out/status.json
+          st=failure
+          ds="focused Mac CI did not report a result"
+          if [ -f "$p" ]; then
+            st=$(jq -r '.state // "failure"' "$p")
+            ds=$(jq -r '.desc // "did not complete"' "$p")
+          fi
+          if [ "$st" = neutral ]; then st=failure; fi
+          gh api "repos/$REPO/statuses/$SHA" -f context=focused-mac-ci -f state="$st" -f target_url="$URL" -f description="$ds"

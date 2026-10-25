@@ -1,0 +1,12 @@
+{
+ "id": "44",
+ "source_head": "b8602a2c182e85602c0f8419cfc8ef651a3cd31f",
+ "github_branch": "perf/44",
+ "focus": "draft",
+ "named_filters": [
+  {
+   "package": "effectcraft-ui-egui",
+   "test": "build_queue_"
+  }
+ ]
+}
