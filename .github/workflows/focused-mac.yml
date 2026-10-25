@@ -1,13 +1,12 @@
 name: focused-mac-ci
 # Supplemental, focused macOS CI for migration source heads that cannot run the
 # standard merge gate (merge conflicts / pending validation). Lives ONLY on
-# branch perf/ci-migration, is triggered by pushes to that branch only, and
-# never gates, publishes or merges main. It runs focused `cargo test` subsets
+# branch perf/ci-migration, is called only by ci.yml for a manually dispatched
+# run on that branch, and never gates, publishes or merges main. It runs focused `cargo test` subsets
 # and reports honest results only: no GPU/UI/criterion benchmarks and no
 # performance acceptance, not a replacement for the standard PR gate.
 on:
-  push:
-    branches: [perf/ci-migration]
+  workflow_call:
 
 permissions:
   contents: read
