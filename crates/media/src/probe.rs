@@ -20,9 +20,9 @@ pub fn probe(path: impl AsRef<Path>) -> Result<Footage> {
     if let Some(src) = crate::stream::probe_source(path) {
         let mut f = footage_from_info(&path.to_string_lossy(), src?.info());
         let header = crate::stream::movie_header(path);
-        let turn = header.as_deref().map_or(Orientation::NoTransforms, video_turn);
+        let (turn, rate) = header.as_deref().map_or((Orientation::NoTransforms, None), video_metadata);
         turn_footage(&mut f, turn);
-        correct_rate(&mut f, header.as_deref().and_then(video_rate));
+        correct_rate(&mut f, rate);
         return Ok(f);
     }
     let bytes = std::fs::read(path).map_err(|e| MediaError::Io(format!("{}: {e}", path.display())))?;
@@ -105,8 +105,7 @@ pub fn probe_bytes(path: &str, bytes: Arc<[u8]>) -> Result<Footage> {
         return probe_still_bytes(path, &bytes, fmt);
     }
     let name = Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
-    let turn = video_turn(&bytes);
-    let rate = video_rate(&bytes);
+    let (turn, rate) = video_metadata(&bytes);
     let src = filmcraft_codecs::open_bytes(&name, bytes)?;
     let mut f = footage_from_info(path, src.info());
     turn_footage(&mut f, turn);
@@ -259,12 +258,23 @@ pub(crate) fn load_oriented(bytes: &[u8], fmt: Option<image::ImageFormat>) -> im
     Ok(img)
 }
 
+/// The rotation and corrected frame rate an MP4/MOV movie asks for, from one parse of its header.
+fn video_metadata(bytes: &[u8]) -> (Orientation, Option<FrameRate>) {
+    let Ok(file) = filmcraft_isobmff::open(bytes) else { return (Orientation::NoTransforms, None) };
+    (video_turn_from_file(&file), video_rate(&file))
+}
+
 /// The rotation an MP4/MOV movie is shown with (a phone held upright records sideways frames and
 /// says so in its video track's header): the quarter turn nearest the track's rotation. Only the
 /// rotation counts; any mirroring, scaling or offset in the header is ignored, and other
 /// containers have none.
 pub(crate) fn video_turn(bytes: &[u8]) -> Orientation {
     let Ok(file) = filmcraft_isobmff::open(bytes) else { return Orientation::NoTransforms };
+    video_turn_from_file(&file)
+}
+
+/// [`video_turn`] from a parsed file: the quarter turn nearest its first video track's rotation.
+fn video_turn_from_file(file: &filmcraft_isobmff::Mp4File) -> Orientation {
     let Some(m) = file.tracks.iter().find(|t| t.kind == filmcraft_isobmff::TrackKind::Video).map(|t| t.matrix) else {
         return Orientation::NoTransforms;
     };
@@ -283,8 +293,7 @@ pub(crate) fn video_turn(bytes: &[u8]) -> Orientation {
 /// milliseconds: a 30 fps clip's frames last 33 or 34 ms and a 60 fps clip's 16 or 17 ms, whose
 /// median reads as 30.303 or 58.824 fps. `None` for other containers and for movies the median
 /// reads right.
-fn video_rate(bytes: &[u8]) -> Option<FrameRate> {
-    let file = filmcraft_isobmff::open(bytes).ok()?;
+fn video_rate(file: &filmcraft_isobmff::Mp4File) -> Option<FrameRate> {
     let t = file.tracks.iter().find(|t| t.kind == filmcraft_isobmff::TrackKind::Video && !t.samples.is_empty())?;
     averaged_rate(t.timescale, t.samples.iter().take(240).map(|s| s.duration))
 }
@@ -317,12 +326,46 @@ fn averaged_rate(timescale: u32, durations: impl Iterator<Item = u32>) -> Option
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use filmcraft_isobmff::{Brand, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions};
+
     use super::*;
 
     /// Durations (in 1/`timescale` s) of `n` frames at `rate` whose times are rounded to the timescale.
     fn rounded(rate: FrameRate, timescale: i64, n: i64) -> Vec<u32> {
         let at = |k: i64| (2 * k * timescale * rate.den + rate.num) / (2 * rate.num);
         (0..n).map(|k| (at(k + 1) - at(k)) as u32).collect()
+    }
+
+    /// An original 16 by 8 JPEG, the payload of every generated movie's frames.
+    fn jpeg_16x8() -> Vec<u8> {
+        let img = image::RgbImage::from_fn(16, 8, |x, y| image::Rgb([(x * 16) as u8, (y * 32) as u8, 64]));
+        let mut out = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img).write_to(&mut out, image::ImageFormat::Jpeg).expect("encode jpeg");
+        out.into_inner()
+    }
+
+    /// A one-track MP4 whose MJPEG video samples last `durations` (in 1/`timescale` s), with the
+    /// rotation part of its version 0 `tkhd` matrix (`[a b; c d]`, 16.16 fixed point) replaced.
+    fn synthetic_mp4(durations: &[u32], timescale: u32, abcd: Option<[i32; 4]>) -> Vec<u8> {
+        let jpeg = jpeg_16x8();
+        let mut mux = Mp4Writer::new(Cursor::new(Vec::new()), WriterOptions::new(Brand::Mp4)).expect("mux");
+        let t = mux.add_track(TrackConfig::new(SampleEntry::jpeg(16, 8), timescale)).expect("track");
+        for &duration in durations {
+            mux.write_sample(t, WriteSample { data: &jpeg, duration, composition_offset: 0, is_sync: true }).expect("sample");
+        }
+        let mut bytes = mux.finish().expect("finish").into_inner();
+        if let Some([a, b, c, d]) = abcd {
+            // (The video track comes first; a version 0 `tkhd` has its matrix 44 bytes after the type.)
+            let at = bytes.windows(4).position(|w| w == b"tkhd").expect("tkhd");
+            assert_eq!(bytes[at + 4], 0, "a version 0 tkhd");
+            for (slot, v) in [0, 1, 3, 4].into_iter().zip([a, b, c, d]) {
+                let o = at + 44 + slot * 4;
+                bytes[o..o + 4].copy_from_slice(&v.to_be_bytes());
+            }
+        }
+        bytes
     }
 
     /// A model's side files are read from beside it; a URI to another computer is not followed.
@@ -371,6 +414,79 @@ mod tests {
         assert_eq!(averaged_rate(0, [33, 34, 33].into_iter()), None);
         assert_eq!(averaged_rate(u32::MAX, [u32::MAX, u32::MAX - 1, 1, 0].into_iter()), None);
         assert_eq!(averaged_rate(u32::MAX, [u32::MAX; 300].into_iter()), None);
-        assert_eq!(video_rate(b"not a movie"), None);
+        assert_eq!(video_metadata(b"not a movie").1, None);
+    }
+
+    #[test]
+    fn mp4_metadata_preserves_rotation_and_rounded_rates() {
+        const ONE: i32 = 0x1_0000;
+        let rotations = [
+            (Orientation::NoTransforms, [ONE, 0, 0, ONE]),
+            (Orientation::Rotate90, [0, ONE, -ONE, 0]),
+            (Orientation::Rotate180, [-ONE, 0, 0, -ONE]),
+            (Orientation::Rotate270, [0, -ONE, ONE, 0]),
+        ];
+        for rate in [FrameRate::FPS_30, FrameRate::FPS_60, FrameRate::FPS_23_976, FrameRate::FPS_29_97, FrameRate::FPS_59_94] {
+            let durations = rounded(rate, 1000, 240);
+            for (turn, matrix) in rotations {
+                let bytes = synthetic_mp4(&durations, 1000, Some(matrix));
+                assert_eq!(video_metadata(&bytes), (turn, Some(rate)), "{rate:?} {turn:?}");
+                assert_eq!(video_turn(&bytes), turn, "{rate:?} {turn:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn mp4_metadata_track_selection_and_sample_limit() {
+        const ONE: i32 = 0x1_0000;
+        let bytes = synthetic_mp4(&rounded(FrameRate::FPS_30, 1000, 240), 1000, None);
+        let mut file = filmcraft_isobmff::open(bytes.as_slice()).expect("parse");
+        let mut empty = file.tracks[0].clone();
+        assert_eq!(empty.kind, filmcraft_isobmff::TrackKind::Video);
+        empty.samples.clear();
+        empty.matrix = [0, ONE, 0, -ONE, 0, 0, 0, 0, ONE];
+        file.tracks.insert(0, empty);
+        assert_eq!(video_turn_from_file(&file), Orientation::Rotate90);
+        assert_eq!(video_rate(&file), Some(FrameRate::FPS_30));
+
+        let mut durations = rounded(FrameRate::FPS_60, 1000, 240);
+        durations.extend([20; 60]);
+        let mut file = filmcraft_isobmff::open(synthetic_mp4(&durations, 1000, None).as_slice()).expect("parse");
+        assert_eq!(video_rate(&file), Some(FrameRate::FPS_60));
+
+        file.tracks.clear();
+        assert_eq!((video_turn_from_file(&file), video_rate(&file)), (Orientation::NoTransforms, None));
+    }
+
+    #[test]
+    fn mp4_metadata_malformed_defaults() {
+        let good = synthetic_mp4(&[33, 34, 33], 1000, None);
+        let at = good.windows(4).position(|w| w == b"moov").expect("moov");
+        let truncated = &good[..at + 12];
+        for bytes in [b"".as_slice(), b"not a movie".as_slice(), truncated] {
+            assert_eq!(video_metadata(bytes), (Orientation::NoTransforms, None));
+            assert_eq!(video_turn(bytes), Orientation::NoTransforms);
+        }
+        assert!(probe_bytes("junk.mp4", b"not a movie".to_vec().into()).is_err());
+    }
+
+    #[test]
+    fn mp4_probe_disk_and_bytes_preserve_metadata() {
+        const ONE: i32 = 0x1_0000;
+        let bytes = synthetic_mp4(&[33, 34, 33], 1000, Some([0, ONE, -ONE, 0]));
+        let mem = probe_bytes("synthetic.mp4", bytes.clone().into()).expect("probe bytes");
+        assert_eq!(mem.kind, FootageKind::Video);
+        assert_eq!(mem.frame_rate, FrameRate::FPS_30);
+        assert_eq!((mem.width, mem.height), (8, 16));
+        assert_eq!(mem.pixel_aspect, 1.0);
+
+        let path = std::env::temp_dir().join(format!("effectcraft-probe-28-{}.mp4", std::process::id()));
+        std::fs::write(&path, &bytes).expect("write");
+        let disk = probe(&path).expect("probe disk");
+        std::fs::remove_file(&path).expect("remove");
+        assert_eq!(disk.kind, FootageKind::Video);
+        assert_eq!(disk.frame_rate, FrameRate::new(30_303, 1_000));
+        assert_eq!((disk.width, disk.height), (8, 16));
+        assert_eq!(disk.pixel_aspect, 1.0);
     }
 }
