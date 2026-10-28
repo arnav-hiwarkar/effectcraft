@@ -1,0 +1,16 @@
+{
+ "id": "4a",
+ "source_head": "f76561698bb6144fe2306a9b6028172a5c80102f",
+ "github_branch": "perf/4a",
+ "focus": "draft",
+ "named_filters": [
+  {
+   "package": "effectcraft-gpu",
+   "test": "owned_devices_favour_memory_usage"
+  },
+  {
+   "package": "effectcraft",
+   "test": "the_window_device_favours_memory_usage"
+  }
+ ]
+}

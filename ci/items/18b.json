@@ -1,0 +1,20 @@
+{
+ "id": "18b",
+ "source_head": "e7a12ae79023f69c564d90d8decc85b0d0fbdcbc",
+ "github_branch": "perf/18b",
+ "focus": "draft",
+ "named_filters": [
+  {
+   "package": "effectcraft-render",
+   "test": "budgeted_layer_reports_bytes_and_preserves_shrink_lru"
+  },
+  {
+   "package": "effectcraft-media",
+   "test": "budgeted_media_reports_bytes_and_preserves_newest_frame"
+  },
+  {
+   "package": "effectcraft-media",
+   "test": "lru_respects_budget_and_recycles"
+  }
+ ]
+}
