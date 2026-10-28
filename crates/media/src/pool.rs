@@ -350,6 +350,13 @@ impl MediaPool {
         crate::exr_channels::forget(path);
     }
 
+    /// Close the open decoder of `path` (its threads and buffers), keeping its decoded frames: a
+    /// read the frame cache can't answer opens it again. A thread still decoding holds its own
+    /// handle, so the decoder drops with the last one.
+    pub fn release_decoder(&self, path: &str) {
+        lock(&self.inner.sources).remove(path);
+    }
+
     /// Provide the contents of `path` from memory (used instead of the file system; web builds).
     pub fn add_bytes(&self, path: &str, bytes: Arc<[u8]>) {
         lock(&self.inner.files).insert(path.to_string(), bytes);
@@ -884,6 +891,9 @@ impl FootageSource for MediaPool {
     }
     fn forget(&self, path: &str) {
         MediaPool::forget(self, path);
+    }
+    fn release_decoder(&self, path: &str) {
+        MediaPool::release_decoder(self, path);
     }
     fn cache_budget(&self) -> Option<usize> {
         Some(self.budget())

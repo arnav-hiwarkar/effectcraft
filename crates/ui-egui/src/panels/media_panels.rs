@@ -46,6 +46,9 @@ fn thumbnail(app: &EffectcraftApp, ctx: &egui::Context, path: &str, budget: &mut
         // A synthetic item id keyed by the path (the frame cache keys on the path).
         let hid = path.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3)) | (1 << 62);
         let img = app.session.footage.frame(ItemId(hid), &f, effectcraft_engine::time::Tick::ZERO)?;
+        if !app.session.footage_path_in_use(&f.path) {
+            app.session.footage.release_decoder(&f.path);
+        }
         let step = (img.width.max(img.height) as f32 / 128.0).ceil().max(1.0) as u32;
         let (w, h) = (img.width.div_ceil(step), img.height.div_ceil(step));
         let full = img.to_rgba8();
