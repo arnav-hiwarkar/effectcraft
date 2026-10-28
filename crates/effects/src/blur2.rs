@@ -1047,7 +1047,12 @@ mod tests {
             }
 
             let blurred = out.get(30, 10);
-            assert!((blurred[0] - 0.5).abs() < 0.2, "linear={linear}, blurred region should be blurred: {blurred:?}");
+            // The iris averages the 1.0/0.0 stripes to mid-grey in the working space, and the
+            // effect always outputs sRGB — in linear mode the rendered pixel therefore decodes
+            // back to that average (sRGB-encoded mid-grey is ≈ 0.73, not 0.5).
+            let (c, a) = unpremul(blurred);
+            let value = if linear { effectcraft_color::srgb_to_linear(c[0].max(0.0)) * a } else { c[0] * a };
+            assert!((value - 0.5).abs() < 0.2, "linear={linear}, blurred region should be blurred: {blurred:?}");
         }
     }
 }
