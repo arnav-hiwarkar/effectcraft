@@ -2,11 +2,31 @@ name: CI
 
 # Quality gates for every push to main and every pull request (`cargo xtask ci`), through the
 # suite's shared gate workflow in craft-common-actions.
+#
+# Focused macOS reruns (branch perf/ci-migration dispatches only): pr_list takes
+# up to five numeric fork PR numbers and reruns exactly those live heads;
+# full_batch=true explicitly reruns the legacy committed-item batch. Dispatching
+# with no focused input runs nothing (never an accidental 59-item batch).
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      pr_list:
+        description: >-
+          Focused rerun: fork PR numbers, numeric only, separated by spaces or
+          commas, max 5 distinct. Empty means no focused run this dispatch.
+        required: false
+        type: string
+        default: ''
+      full_batch:
+        description: >-
+          Explicitly run the legacy full committed-items batch (ci/items/) —
+          never combined with pr_list.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -31,5 +51,11 @@ jobs:
     if: github.ref == 'refs/heads/perf/ci-migration'
     permissions:
       contents: read
+      # Matrix job: read-only GET of the dispatched PRs (pull-requests: read).
+      # Tests job: commit status on the exact tested SHA (statuses: write).
+      pull-requests: read
       statuses: write
     uses: ./.github/workflows/focused-mac.yml
+    with:
+      pr_list: ${{ inputs.pr_list || '' }}
+      full_batch: ${{ inputs.full_batch || false }}

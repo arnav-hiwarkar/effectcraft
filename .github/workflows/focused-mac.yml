@@ -5,11 +5,38 @@ name: focused-mac-ci
 # run on that branch, and never gates, publishes or merges main. It runs focused `cargo test` subsets
 # and reports honest results only: no GPU/UI/criterion benchmarks and no
 # performance acceptance, not a replacement for the standard PR gate.
+#
+# Two mutually exclusive focused modes, chosen by the dispatch inputs:
+#   pr_list (<=5 numeric fork PR numbers): the matrix job fetches each PR with
+#     one READ-ONLY API GET (pull-requests: read), verifies it (open, head from
+#     this repository, perf/* branch, current 40-hex sha) and emits sanitized
+#     five-key packets; ci/materialize_packets.py revalidates them per matrix
+#     entry. The report step posts the commit status on the exact tested sha,
+#     and runner.py re-verifies branch tip == source_head at test time.
+#   full_batch=true: the legacy committed-items batch (ci/gen_matrix.py over
+#     ci/items/), now explicit only. Dispatching with no input runs nothing.
 on:
   workflow_call:
+    inputs:
+      pr_list:
+        description: >-
+          Focused rerun: fork PR numbers, numeric only, separated by spaces or
+          commas, max 5 distinct. Passed to the scripts as env data only.
+        required: false
+        type: string
+        default: ''
+      full_batch:
+        description: >-
+          Explicitly run the legacy full committed-items batch (ci/items/) —
+          never combined with pr_list.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  # matrix job: read-only GET of the dispatched PRs; tests job: statuses.
+  pull-requests: read
   statuses: write
 
 concurrency:
@@ -27,9 +54,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 1 # matrix job reads only item JSON files
+          fetch-depth: 1 # matrix job reads only item JSON files; PR mode talks to the API
+      # Inputs travel as env data only (never interpolated into the shell).
+      # PR mode does one bounded, read-only GET per PR with the run token;
+      # full_batch relays ci/gen_matrix.py over the committed packets;
+      # no input runs nothing (count=0, tests job skips).
       - id: gen
-        run: python3 ci/gen_matrix.py ci/items >> "$GITHUB_OUTPUT"
+        env:
+          PR_LIST: ${{ inputs.pr_list }}
+          FULL_BATCH: ${{ inputs.full_batch }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: python3 ci/build_matrix.py ci/items >> "$GITHUB_OUTPUT"
 
   tests:
     needs: matrix
@@ -50,6 +86,16 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12" # runner needs tomllib (3.11+) for manifest parse
+      # workflow_dispatch PR mode: materialize this entry's runtime packet.
+      # $MATRIX/$ITEM_ID are env data; nothing is shell-evaluated. The script
+      # revalidates the sanitized packet (runner.load_item contract) and the
+      # entry's head == packet source_head. Batch items come from the checkout
+      # and need no materialization.
+      - name: Materialize focused packets for this entry
+        env:
+          MATRIX: ${{ needs.matrix.outputs.matrix }}
+          ITEM_ID: ${{ matrix.id }}
+        run: python3 ci/materialize_packets.py
       - name: Ensure stable toolchain
         run: |
           rustup toolchain install stable --profile minimal
