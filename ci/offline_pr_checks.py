@@ -292,6 +292,10 @@ check("limits wording intact (45min, parallel 3, no fail-fast, registry cache)",
       "timeout-minutes: 45" in yml and "max-parallel: 3" in yml
       and "fail-fast: false" in yml
       and "focused-mac-registry-${{ runner.os }}" in yml)
+check("concurrency is per-run (distinct dispatch batches coexist instead of "
+      "canceling each other)",
+      "group: focused-mac-ci-${{ github.ref }}-${{ github.run_id }}" in yml
+      and "cancel-in-progress: true" not in yml)
 
 print("OFFLINE PR CHECKS:", "ALL PASS" if not failures
       else f"{len(failures)} FAILURES {failures}")

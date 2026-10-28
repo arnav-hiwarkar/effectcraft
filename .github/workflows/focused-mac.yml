@@ -40,8 +40,12 @@ permissions:
   statuses: write
 
 concurrency:
-  group: focused-mac-ci-${{ github.ref }}
-  cancel-in-progress: true # a newer push to this branch cancels its older runs
+  # One group per run: including github.run_id lets distinct targeted dispatch
+  # batches on perf/ci-migration coexist (they no longer cancel each other and
+  # lose tests). Same-head duplicate work is deduplicated by the manager at
+  # dispatch time. max-parallel=3 still bounds each run's tests strategy.
+  group: focused-mac-ci-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   matrix:
