@@ -1410,8 +1410,11 @@ mod tests {
         let res_repeat = run("ec.distort.upscale", &set_zero, im.clone(), &[]);
         assert_eq!(res_zero.img, res_repeat.img);
 
-        // Positive noise reduction triggers blur and differs from zero-noise execution
-        let set_pos = [("scale", num(200.0)), ("reduceNoise", num(20.0)), ("detail", num(10.0))];
+        // Positive noise reduction triggers blur and differs from zero-noise execution.
+        // Max (100.0) because smaller values are a documented no-op: reduceNoise 20 maps to a
+        // sigma of 0.3 px, under the ~0.6 px floor where gaussian_blur's box passes all shrink
+        // to radius zero (blur.rs box_radii) and the blur returns a bit-identical clone.
+        let set_pos = [("scale", num(200.0)), ("reduceNoise", num(100.0)), ("detail", num(10.0))];
         let res_pos = run("ec.distort.upscale", &set_pos, im.clone(), &[]);
         assert_ne!(res_zero.img, res_pos.img);
 
