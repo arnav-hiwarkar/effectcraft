@@ -39,6 +39,17 @@ pub enum MediaError {
     Unsupported(String),
     #[error("decode error: {0}")]
     Decode(String),
+    /// A movie frame's pixels could not be allocated (its size is out of reach).
+    #[error("cannot allocate {width} x {height} movie frame buffer; reduce frame size or free memory")]
+    FrameBuffer {
+        /// The frame's width, as the file says it.
+        width: u32,
+        /// The frame's height, as the file says it.
+        height: u32,
+        /// Why the allocation was refused (none when the size itself is out of range).
+        #[source]
+        source: Option<std::collections::TryReserveError>,
+    },
     /// The read was called off before it finished (see [`effectcraft_render::FootageSource::cancellable`]).
     #[error("cancelled")]
     Cancelled,

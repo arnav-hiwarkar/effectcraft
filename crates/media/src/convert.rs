@@ -13,6 +13,8 @@ use filmcraft_color::{Matrix, Range};
 use filmcraft_frame::{Chroma, PixelData, VideoFrame};
 use rayon::prelude::*;
 
+use crate::MediaError;
+
 /// How to turn a (colour, alpha) sample into a premultiplied pixel.
 #[derive(Clone, Copy)]
 pub(crate) struct AlphaOp {
@@ -64,20 +66,39 @@ impl AlphaOp {
 
 /// Convert a FilmCraft frame to an [`Image`].
 #[cfg(test)]
+#[allow(clippy::expect_used)] // the tests' frames are small: this cannot fail
 pub(crate) fn frame_to_image(f: &VideoFrame, op: AlphaOp) -> Image {
-    frame_to_image_in(f, op, Vec::new())
+    frame_to_image_in(f, op, Vec::new()).expect("a frame the tests convert fits in memory")
+}
+
+/// The number of pixels in a frame of `width` × `height`, or the error to show when the frame's
+/// size is out of reach: the arithmetic overflows, or the buffer's bytes cannot be addressed.
+pub(crate) fn frame_pixel_count(width: u32, height: u32) -> crate::Result<usize> {
+    // Two u32 sizes fit a u64; the buffer's bytes must fit the address space, its pixels a usize.
+    let pixels = u64::from(width).checked_mul(u64::from(height)).ok_or(MediaError::FrameBuffer { width, height, source: None })?;
+    let bytes = pixels.checked_mul(std::mem::size_of::<Px>() as u64).ok_or(MediaError::FrameBuffer { width, height, source: None })?;
+    if bytes > isize::MAX as u64 || pixels > usize::MAX as u64 {
+        return Err(MediaError::FrameBuffer { width, height, source: None });
+    }
+    Ok(pixels as usize)
 }
 
 /// Convert a FilmCraft frame to an [`Image`], reusing `buf`'s allocation when it is large enough
-/// (every pixel is overwritten, so a recycled frame's contents do not matter).
-pub(crate) fn frame_to_image_in(f: &VideoFrame, op: AlphaOp, mut buf: Vec<Px>) -> Image {
+/// (every pixel is overwritten, so a recycled frame's contents do not matter). A frame whose
+/// buffer cannot be allocated is an error, not an abort.
+pub(crate) fn frame_to_image_in(f: &VideoFrame, op: AlphaOp, mut buf: Vec<Px>) -> crate::Result<Image> {
     let (w, h) = (f.width as usize, f.height as usize);
-    if buf.len() != w * h {
-        buf = vec![[0.0; 4]; w * h];
+    let count = frame_pixel_count(f.width, f.height)?;
+    if buf.len() != count {
+        // A buffer of another size is of no use: drop it and ask for one of the right size,
+        // without the allocator aborting the app when it refuses.
+        buf = Vec::new();
+        buf.try_reserve_exact(count).map_err(|source| MediaError::FrameBuffer { width: f.width, height: f.height, source: Some(source) })?;
+        buf.resize(count, [0.0; 4]);
     }
     let mut img = Image { width: f.width, height: f.height, data: buf };
     if w == 0 || h == 0 {
-        return img;
+        return Ok(img);
     }
     match &f.data {
         PixelData::Rgba8(d) => {
@@ -111,7 +132,7 @@ pub(crate) fn frame_to_image_in(f: &VideoFrame, op: AlphaOp, mut buf: Vec<Px>) -
             convert_yuv(&mut img, w, h, *chroma, [&planes[0][..], &planes[1][..], &planes[2][..]], alpha.as_deref().map(|a| &a[..]), amax, &yuv, op);
         }
     }
-    img
+    Ok(img)
 }
 
 /// A movie frame turned the way its file says it is shown ([`crate::probe::video_turn`]:
