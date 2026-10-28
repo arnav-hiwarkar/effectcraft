@@ -715,8 +715,10 @@ fn decode_frame(p: &[u8]) -> Option<Frame8> {
     }
     let w = u32::from_le_bytes(p[0..4].try_into().ok()?);
     let h = u32::from_le_bytes(p[4..8].try_into().ok()?);
+    let n = usize::try_from(w).ok()?.checked_mul(usize::try_from(h).ok()?)?;
+    let expected = n.checked_mul(4)?;
     let rgba = lz4_flex::decompress_size_prepended(&p[8..]).ok()?;
-    (rgba.len() == w as usize * h as usize * 4).then_some(Frame8 { width: w, height: h, rgba })
+    (rgba.len() == expected).then_some(Frame8 { width: w, height: h, rgba })
 }
 
 fn encode_layer(b: &Buf) -> Vec<u8> {
@@ -751,9 +753,10 @@ fn decode_layer(p: &[u8]) -> Option<Buf> {
     let f = |i: usize| -> Option<f64> { Some(f64::from_le_bytes(p[i..i + 8].try_into().ok()?)) };
     let offset = [f(8)?, f(16)?];
     let scale = f(24)?;
+    let n = usize::try_from(w).ok()?.checked_mul(usize::try_from(h).ok()?)?;
+    let expected = n.checked_mul(16)?;
     let planes = lz4_flex::decompress_size_prepended(&p[32..]).ok()?;
-    let n = w as usize * h as usize;
-    if planes.len() != n * 16 {
+    if planes.len() != expected {
         return None;
     }
     let mut img = Image::new(w, h);
@@ -946,6 +949,69 @@ mod tests {
         assert_eq!(parse_entry_name(&entry_name(key)), Some(key));
         assert_eq!(parse_entry_name("abc.ecc"), None);
         assert_eq!(parse_entry_name(&format!("{key:032x}.tmp.1")), None);
+    }
+
+    #[test]
+    fn rejects_overflowing_frame_dimensions() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        payload.extend_from_slice(&lz4_flex::compress_prepend_size(&[]));
+        assert!(read_frame_entry(&seal(Kind::Frame, &payload)).is_none());
+    }
+
+    #[test]
+    fn rejects_overflowing_layer_dimensions() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        for value in [1.5_f64, -2.25, 0.5] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        payload.extend_from_slice(&lz4_flex::compress_prepend_size(&[]));
+        assert!(read_layer_entry(&seal(Kind::Layer, &payload)).is_none());
+    }
+
+    #[test]
+    fn image_entry_validation_preserves_parity() {
+        for len in 0..8 {
+            assert!(read_frame_entry(&seal(Kind::Frame, &vec![0; len])).is_none());
+        }
+        for len in 0..32 {
+            assert!(read_layer_entry(&seal(Kind::Layer, &vec![0; len])).is_none());
+        }
+        let mut frame_header = Vec::new();
+        frame_header.extend_from_slice(&1_u32.to_le_bytes());
+        frame_header.extend_from_slice(&1_u32.to_le_bytes());
+        let mut layer_header = frame_header.clone();
+        for value in [1.5_f64, -2.25, 0.5] {
+            layer_header.extend_from_slice(&value.to_le_bytes());
+        }
+        assert!(read_frame_entry(&seal(Kind::Frame, &frame_header)).is_none());
+        assert!(read_layer_entry(&seal(Kind::Layer, &layer_header)).is_none());
+        let empty = lz4_flex::compress_prepend_size(&[]);
+        frame_header.extend_from_slice(&empty);
+        layer_header.extend_from_slice(&empty);
+        assert!(read_frame_entry(&seal(Kind::Frame, &frame_header)).is_none());
+        assert!(read_layer_entry(&seal(Kind::Layer, &layer_header)).is_none());
+
+        assert_eq!(read_frame_entry(&frame_entry(1, 1, &[1, 2, 3, 4])), Some(Frame8 { width: 1, height: 1, rgba: vec![1, 2, 3, 4] }));
+        let mut img = Image::new(1, 1);
+        img.data[0] = [0.25, 0.5, 0.75, 1.0];
+        let layer = Buf { img, offset: [1.5, -2.25], scale: 0.5 };
+        let back = read_layer_entry(&layer_entry(&layer)).unwrap();
+        assert_eq!((back.img.width, back.img.height), (1, 1));
+        assert_eq!(back.img.data, vec![[0.25, 0.5, 0.75, 1.0]]);
+        assert_eq!(back.offset, [1.5, -2.25]);
+        assert_eq!(back.scale, 0.5);
+
+        for (width, height) in [(0, 2), (2, 0), (0, u32::MAX)] {
+            assert_eq!(read_frame_entry(&frame_entry(width, height, &[])), Some(Frame8 { width, height, rgba: vec![] }));
+            let layer = Buf { img: Image::new(width, height), offset: [1.5, -2.25], scale: 0.5 };
+            let back = read_layer_entry(&layer_entry(&layer)).unwrap();
+            assert_eq!((back.img.width, back.img.height), (width, height));
+            assert!(back.img.data.is_empty());
+        }
     }
 
     /// Segmentations round-trip by (chain key, scale), survive a reopen (rescan), are bounded by
