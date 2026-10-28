@@ -594,7 +594,8 @@ mod tests {
         // Increment and Save sees the store's files.
         let fs = WebConfig::new(s.clone());
         fs.files().write(Path::new("/A.ecproj"), b"{}").unwrap();
-        let next = effectcraft_engine::autosave::increment_path("/A.ecproj", |p| fs.files().is_file(Path::new(p)));
+        let next =
+            effectcraft_engine::autosave::increment_path("/A.ecproj", |p| fs.files().is_file(Path::new(p))).expect("ordinary stem has a free next version");
         assert_eq!(next, "/A 2.ecproj");
     }
 
