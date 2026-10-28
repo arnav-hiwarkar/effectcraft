@@ -5,6 +5,7 @@
 //! All warps are inverse mapped: every output pixel finds the source point that lands on it.
 //! Pixel-sized parameters are multiplied by the buffer scale (downsampled previews).
 
+use std::borrow::Cow;
 use std::f64::consts::{PI, TAU};
 
 use effectcraft_geom::{Mat3, vec2};
@@ -853,7 +854,7 @@ fn upscale(ctx: &EffectCtx, mut b: Buf) -> Buf {
     }
     let detail = (ctx.params.f("detail") / 100.0) as f32;
     let noise = ctx.params.f("reduceNoise") / 100.0;
-    let src = if noise > 0.0 { effectcraft_raster::gaussian_blur(&b.img, noise * 1.5, noise * 1.5, true) } else { b.img.clone() };
+    let src = if noise > 0.0 { Cow::Owned(effectcraft_raster::gaussian_blur(&b.img, noise * 1.5, noise * 1.5, true)) } else { Cow::Borrowed(&b.img) };
     let lc = [ctx.layer_size[0] * 0.5, ctx.layer_size[1] * 0.5];
     // Alpha: Bilinear (index 0) resamples the alpha channel bilinearly, Bicubic like the colour.
     let bilinear_alpha = ctx.params.e("alpha") == 0;
@@ -1391,6 +1392,102 @@ mod tests {
         assert_eq!(o.offset, [10.0, 5.0]);
         let c = o.img.sample_bilinear(20.0, 10.0);
         assert!((c[0] - im.sample_bilinear(10.0, 5.0)[0]).abs() < 0.03);
+    }
+
+    #[test]
+    fn upscale_zero_noise_avoids_clone_and_matches_output() {
+        let im = img(32, 24);
+        let set_zero = [("scale", num(200.0)), ("reduceNoise", num(0.0)), ("detail", num(10.0))];
+        let set_neg = [("scale", num(200.0)), ("reduceNoise", num(-1.0)), ("detail", num(10.0))];
+        let res_zero = run("ec.distort.upscale", &set_zero, im.clone(), &[]);
+        let res_neg = run("ec.distort.upscale", &set_neg, im.clone(), &[]);
+        assert_eq!(res_zero.img.width, 64);
+        assert_eq!(res_zero.img.height, 48);
+        assert_eq!(res_zero.img, res_neg.img);
+        assert_eq!(res_zero.offset, res_neg.offset);
+
+        // Reference parity against the pre-change implementation: the golden below was
+        // captured from fork main 991904888a20b7d (the clone-based upscale, before this
+        // PR) by running exactly this synthetic input and settings through it. The
+        // borrowed zero-noise path is therefore compared with independent old-main
+        // reference output, not merely a rerun of the changed code.
+        let res_gold = run("ec.distort.upscale", &[("scale", num(200.0)), ("reduceNoise", num(0.0)), ("detail", num(10.0))], img(4, 3), &[]);
+        assert_eq!((res_gold.img.width, res_gold.img.height), (8, 6));
+        assert_eq!(res_gold.offset, [2.0, 1.5]);
+        let golden: [[f32; 4]; 48] = [
+            [0.0, 0.0, 0.0, 1.0],
+            [0.03815104, 0.0, 0.09734358, 1.0],
+            [0.18059896, 0.0, 0.5287508, 1.0],
+            [0.31289062, 0.0, 0.5852724, 1.0],
+            [0.43710938, 0.0, 0.2635546, 1.0],
+            [0.56910807, 0.0, 0.34803766, 1.0],
+            [0.71097004, 0.0, 0.83273906, 1.0],
+            [0.7740234, 0.0, 1.0099155, 1.0],
+            [0.0, 0.05073785, 0.0, 1.0],
+            [0.03815104, 0.05073785, 0.17350733, 1.0],
+            [0.18059896, 0.05073785, 0.62182045, 1.0],
+            [0.31289062, 0.05073785, 0.68588203, 1.0],
+            [0.43710938, 0.05073785, 0.36473164, 1.0],
+            [0.56910807, 0.05073785, 0.36277068, 1.0],
+            [0.71097004, 0.05073785, 0.672287, 1.0],
+            [0.7740234, 0.05073785, 0.8101008, 1.0],
+            [0.0, 0.24014756, 0.12912486, 1.0],
+            [0.03815104, 0.24014756, 0.3460596, 1.0],
+            [0.18059896, 0.24014756, 0.83125144, 1.0],
+            [0.31289062, 0.24014756, 0.9116525, 1.0],
+            [0.43710938, 0.24014756, 0.5897403, 1.0],
+            [0.56910807, 0.24014756, 0.3927765, 1.0],
+            [0.71097004, 0.24014756, 0.31236362, 1.0],
+            [0.7740234, 0.24014756, 0.27497393, 1.0],
+            [0.0, 0.42612848, 0.30846354, 1.0],
+            [0.03815104, 0.42612848, 0.43922845, 1.0],
+            [0.18059896, 0.42612848, 0.7298754, 1.0],
+            [0.31289062, 0.42612848, 0.81796634, 1.0],
+            [0.43710938, 0.42612848, 0.7087341, 1.0],
+            [0.56910807, 0.42612848, 0.5195787, 1.0],
+            [0.71097004, 0.42612848, 0.24485764, 1.0],
+            [0.7740234, 0.42612848, 0.12153487, 1.0],
+            [0.0, 0.614757, 0.51706636, 1.0],
+            [0.03815104, 0.614757, 0.4548998, 1.0],
+            [0.18059896, 0.614757, 0.31777442, 1.0],
+            [0.31289062, 0.614757, 0.404795, 1.0],
+            [0.43710938, 0.614757, 0.7225706, 1.0],
+            [0.56910807, 0.614757, 0.7439238, 1.0],
+            [0.71097004, 0.614757, 0.46871176, 1.0],
+            [0.7740234, 0.614757, 0.34685114, 1.0],
+            [0.0, 0.6986979, 0.6122997, 1.0],
+            [0.03815104, 0.6986979, 0.46374568, 1.0],
+            [0.18059896, 0.6986979, 0.13212223, 1.0],
+            [0.31289062, 0.6986979, 0.21853802, 1.0],
+            [0.43710938, 0.6986979, 0.72993386, 1.0],
+            [0.56910807, 0.6986979, 0.8449029, 1.0],
+            [0.71097004, 0.6986979, 0.5677574, 1.0],
+            [0.7740234, 0.6986979, 0.4458097, 1.0],
+        ];
+        assert_eq!(res_gold.img.data, golden);
+
+        // Positive noise reduction triggers blur and differs from zero-noise execution.
+        // Max (100.0) because smaller values are a documented no-op: reduceNoise 20 maps to a
+        // sigma of 0.3 px, under the ~0.6 px floor where gaussian_blur's box passes all shrink
+        // to radius zero (blur.rs box_radii) and the blur returns a bit-identical clone.
+        let set_pos = [("scale", num(200.0)), ("reduceNoise", num(100.0)), ("detail", num(10.0))];
+        let res_pos = run("ec.distort.upscale", &set_pos, im.clone(), &[]);
+        assert_ne!(res_zero.img, res_pos.img);
+
+        // Adjustment layer mode: samples from borrowed buffer and places scaled pixels about layer center
+        let s = crate::find("ec.distort.upscale").unwrap();
+        let ls = [im.width as f64, im.height as f64];
+        let mut params = Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
+        for (k, v) in &set_zero {
+            params.values.insert(k.to_string(), v.clone());
+        }
+        let ctx_adj = EffectCtx { params: &params, time: 0.0, layer_size: ls, seed: 1, adjustment: true, env: Default::default() };
+        let res_adj = crate::apply(s, &ctx_adj, Buf { img: im.clone(), offset: [0.0, 0.0], scale: 1.0 });
+        assert_eq!((res_adj.img.width, res_adj.img.height), (im.width, im.height));
+        assert_eq!(res_adj.offset, [0.0, 0.0]);
+        let c_orig = im.sample_bilinear(ls[0] * 0.5, ls[1] * 0.5);
+        let c_adj = res_adj.img.sample_bilinear(ls[0] * 0.5, ls[1] * 0.5);
+        assert!((c_adj[0] - c_orig[0]).abs() < 0.05);
     }
 
     #[test]
