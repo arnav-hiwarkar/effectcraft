@@ -554,14 +554,14 @@ mod tests {
         // 256 × 2 steps by 2 along the long side: a 128 × 1 thumbnail of every second column.
         let ([w, h], px) = thumb_pixels(&picture(256, 2)).expect("a picture");
         assert_eq!([w, h], [128, 1]);
-        for (k, p) in px.chunks_exact(4).enumerate() {
-            assert_eq!(p, &[(2 * k) as u8, 0, 0, 255][..], "column {k}");
+        for (k, p) in px.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(*p, [(2 * k) as u8, 0, 0, 255], "column {k}");
         }
         // A tall picture steps its rows the same way.
         let ([w, h], px) = thumb_pixels(&picture(2, 256)).expect("a picture");
         assert_eq!([w, h], [1, 128]);
-        for (k, p) in px.chunks_exact(4).enumerate() {
-            assert_eq!(p, &[0, (2 * k) as u8, 0, 255][..], "row {k}");
+        for (k, p) in px.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(*p, [0, (2 * k) as u8, 0, 255], "row {k}");
         }
         // A picture that already fits is copied as it is.
         let ([w, h], px) = thumb_pixels(&picture(3, 2)).expect("a picture");
