@@ -1614,6 +1614,8 @@ struct Tl {
     p: egui::Painter,
     rows: Arc<Vec<Row>>,
     actions: Vec<(String, serde_json::Value)>,
+    /// A drag that moves the frame on screen this frame (Fast Previews Adaptive Resolution).
+    dragging: bool,
 }
 
 /// [`Tl`] plus what the layer rows and the interactions after them share.
@@ -1765,6 +1767,7 @@ fn layout(app: &mut EffectcraftApp, ui: &egui::Ui, rect: Rect, cid: ItemId, comp
         p,
         rows: Arc::new(Vec::new()),
         actions: Vec::new(),
+        dragging: false,
     }
 }
 
@@ -1909,9 +1912,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     comp_markers_ui(app, ui, g);
     hand_tool_pan(app, ui, g);
     drop_targets(app, ui, g);
+    rw.tl.dragging |= super::graph_tools::alt_scale_active(&rw.tl.ctx);
     let Rw { tl, ui_actions, .. } = rw;
     apply_ui_acts(app, &tl.comp, ui_actions);
-    apply_actions(app, ui, &tl.ctx, tl.actions);
+    apply_actions(app, ui, &tl.ctx, tl.actions, tl.dragging);
 }
 
 /// Applies the UI-only changes the frame collected (twirls, time, ending an undo merge).
@@ -1970,8 +1974,8 @@ fn apply_ui_acts(app: &mut EffectcraftApp, comp: &Comp, ui_actions: Vec<UiAct>) 
 }
 
 /// Runs the commands the frame collected through [`crate::menus::invoke`].
-fn apply_actions(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, actions: Vec<(String, serde_json::Value)>) {
-    if ui.input(|i| i.pointer.primary_down()) && actions.iter().any(|(id, _)| id == "prop.set") {
+fn apply_actions(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, actions: Vec<(String, serde_json::Value)>, dragging: bool) {
+    if ui.input(|i| i.pointer.primary_down()) && (dragging || actions.iter().any(|(id, _)| id == "prop.set")) {
         app.ui.viewer.property_interacting = true;
         ctx.request_repaint();
     }
@@ -2151,7 +2155,7 @@ fn drop_targets(app: &mut EffectcraftApp, ui: &mut egui::Ui, g: &mut Rw) {
 }
 
 /// The header's time display: click to switch style, drag to scrub, double-click to type a time.
-fn header_timecode(app: &mut EffectcraftApp, ui: &mut egui::Ui, g: &Tl) {
+fn header_timecode(app: &mut EffectcraftApp, ui: &mut egui::Ui, g: &mut Tl) {
     let t = g.t;
     let time = g.time;
     let fr = g.fr;
@@ -2181,6 +2185,7 @@ fn header_timecode(app: &mut EffectcraftApp, ui: &mut egui::Ui, g: &Tl) {
     app.auto.add("timeline.timecode", tc_rect, &tc);
     super::toggle_time_display(app, &tc_resp);
     if tc_resp.dragged() {
+        g.dragging = true;
         let d = tc_resp.drag_delta().x as f64;
         let f = fr.frame_at(time) + (d * 0.5).round() as i64;
         let _ = app.session.execute("time.set", json!({"frame": f.max(0)}));
@@ -2480,7 +2485,7 @@ fn ruler_ticks(app: &mut EffectcraftApp, g: &Tl) {
 }
 
 /// Scrubbing in the ruler: the current time follows the pointer.
-fn ruler_scrub(app: &mut EffectcraftApp, ui: &mut egui::Ui, g: &Tl) {
+fn ruler_scrub(app: &mut EffectcraftApp, ui: &mut egui::Ui, g: &mut Tl) {
     let graph_x0 = g.graph_x0;
     let graph_x1 = g.graph_x1;
     let pps = g.pps;
@@ -2498,6 +2503,7 @@ fn ruler_scrub(app: &mut EffectcraftApp, ui: &mut egui::Ui, g: &Tl) {
     if ((rresp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down())) || rresp.clicked())
         && let Some(pt) = rresp.interact_pointer_pos()
     {
+        g.dragging |= rresp.dragged();
         let mut x = pt.x;
         // Zoomed in, a scrub held past either end of the ruler scrolls the timeline that way
         // (faster the further), with the CTI at the edge (After Effects).
@@ -3352,6 +3358,7 @@ fn layer_bar_drag(g: &mut Rw, rc: &RowCtx<'_>, bars: &BarResps, quick: bool) {
             continue;
         }
         if resp.dragged() {
+            g.tl.dragging = true;
             let acc_id = egui::Id::unique(("bar-acc", layer.id.0, kind));
             let mut acc: f32 = ctx.data(|d| d.get_temp(acc_id).unwrap_or(0.0));
             acc += resp.drag_delta().x;
@@ -4588,6 +4595,7 @@ fn quick_offset_follow(g: &mut Rw) {
         let (down, ptr) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.latest_pos()));
         match ptr.filter(|_| down) {
             Some(ptr) => {
+                g.tl.dragging = true;
                 let frames = (((ptr.x - q.origin_x) as f64 / pps) / fd).round() as i64;
                 if frames != q.applied {
                     q.applied = frames;
@@ -4622,6 +4630,7 @@ fn key_drag_follow(app: &mut EffectcraftApp, g: &mut Rw) {
         let (down, ptr, shift) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.latest_pos(), i.modifiers.shift));
         match ptr.filter(|_| down) {
             Some(ptr) => {
+                g.tl.dragging = true;
                 let mut target = kd.anchor + (ptr.x - kd.origin_x) as f64 / pps;
                 if shift {
                     // The current time and whatever it snaps to (keys, layer ends, markers), but
