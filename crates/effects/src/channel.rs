@@ -680,6 +680,14 @@ mod tests {
     }
 
     #[test]
+    fn set_channels_short_fitted_layer_uses_original_pixel() {
+        let base = Image { width: 1, height: 1, data: vec![[0.2, 0.3, 0.4, 1.0], [0.5, 0.6, 0.7, 1.0]] };
+        let other = Image::filled(1, 1, [0.8, 0.0, 0.0, 1.0]);
+        let out = run_host("ec.channel.setchannels", &[("sourceLayer1", Value::Layer(Some(1)))], base, other);
+        assert!(close(out.data[1], [0.5, 0.6, 0.7, 1.0]));
+    }
+
+    #[test]
     fn set_channels_all_layers_in_place() {
         let l1 = Image::filled(4, 4, [0.3, 0.0, 0.0, 1.0]);
         let l2 = Image::filled(4, 4, [0.0, 0.6, 0.0, 1.0]);
