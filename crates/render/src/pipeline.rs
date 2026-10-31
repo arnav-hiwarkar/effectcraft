@@ -494,7 +494,10 @@ impl<'a> Renderer<'a> {
     fn draw_comp(&self, ctx: &EvalCtx<'a>, canvas: &mut Image, mut blank: bool) {
         // Bottom-to-top, with runs of consecutive 3D layers depth-sorted (farthest first).
         let visible = self.visible_layers(ctx);
-        let start = visible.iter().rposition(|layer| self.covers_frame(ctx, layer)).unwrap_or(0);
+        // The topmost solid that provably covers the whole frame hides everything below it:
+        // start drawing there (see `covers_frame`).
+        let comp_has_3d = ctx.comp.layers.iter().any(|l| l.is_3d());
+        let start = visible.iter().rposition(|layer| self.covers_frame(ctx, layer, comp_has_3d)).unwrap_or(0);
         if start > 0 {
             blank = false;
         }
@@ -524,8 +527,11 @@ impl<'a> Renderer<'a> {
     }
 
     /// A bottom-to-top index start: this layer draws opaque Normal over the whole canvas, so
-    /// everything below cannot show. Only runs inside the CPU compositor (nested or top-level).
-    fn covers_frame(&self, ctx: &EvalCtx<'a>, layer: &Layer) -> bool {
+    /// everything below cannot show. Only top-level unscaled frames without a region of
+    /// interest reach here on the CPU compositor; nested comps, collapsed precomps and their
+    /// 3D space are excluded by the renderer-state checks first. `comp_has_3d` is passed in so
+    /// the scan runs once per comp, not once per candidate layer.
+    fn covers_frame(&self, ctx: &EvalCtx<'a>, layer: &Layer, comp_has_3d: bool) -> bool {
         if !self.top
             || self.opts.scale != 1.0
             || self.opts.roi.is_some()
@@ -534,7 +540,7 @@ impl<'a> Renderer<'a> {
             || self.inherited.is_some()
             || self.collapse3d.is_some()
             || self.project.settings.bit_depth == effectcraft_project::BitDepth::Bpc32
-            || ctx.comp.layers.iter().any(|l| l.is_3d())
+            || comp_has_3d
             || !matches!(layer.source, LayerSource::Solid { .. })
             || layer.switches.three_d
             || layer.switches.adjustment

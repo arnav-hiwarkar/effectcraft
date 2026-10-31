@@ -133,14 +133,64 @@ fn occlusion_draws_everything_when_the_top_solid_may_not_cover() {
     }
     // 32 bpc never culls (non-finite values below survive Normal blending).
     let (mut p, cid, comp) = setup();
+    p.settings.bit_depth = effectcraft_project::BitDepth::Bpc32;
     let bottom = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
     let top = solid(&mut p, &comp, [0.0, 1.0, 0.0], 200, 100);
     p.comp_mut(cid).unwrap().layers = vec![top, bottom].into();
     assert_eq!(occlusion_render(&p, cid).1.len(), 2);
 }
 
-/// CPU fallback frames under Backend::Auto (and Backend::Cpu) skip the layers under an opaque
-/// full-frame solid, with the same pixels; a full-frame region of interest never culls.
+/// A smaller solid above a covering solid draws together with it, while the layer below the
+/// covering solid is culled, and the image matches the reference. An inactive covering solid
+/// lets the layer below it draw.
+#[test]
+fn occlusion_keeps_visible_layers_between_drawn_and_inactive_solids() {
+    let (mut p, cid, comp) = setup();
+    p.settings.bit_depth = effectcraft_project::BitDepth::Bpc8;
+    let mut hidden = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+    let mut over = solid(&mut p, &comp, [0.0, 1.0, 0.0], 200, 100);
+    let mut small = solid(&mut p, &comp, [0.0, 0.0, 1.0], 100, 50);
+    let mut inactive = solid(&mut p, &comp, [0.0, 1.0, 0.0], 200, 100);
+    over.name = "Over".into();
+    small.name = "Small".into();
+    hidden.name = "Hidden".into();
+    inactive.name = "Off".into();
+    inactive.switches.video = false;
+    // Stack, visually bottom to top: Hidden (full cover), Over (full cover), Small (partial).
+    p.comp_mut(cid).unwrap().layers = vec![small.clone(), over, hidden.clone()].into();
+    let (img, drawn, reference) = occlusion_render(&p, cid);
+    assert_eq!(drawn, vec!["Over".to_string(), "Small".to_string()], "the covering solid and the smaller layer above it draw; the lowest does not");
+    assert_eq!(img.get(10, 10), [0.0, 1.0, 0.0, 1.0], "the covering solid shows round the smaller layer");
+    assert_eq!(img.get(100, 50), [0.0, 0.0, 1.0, 1.0], "the smaller layer above it paints");
+    assert_same_bits(&img, &reference);
+
+    // Same stack, but with the covering solid inactive: the layer below it draws.
+    p.comp_mut(cid).unwrap().layers = vec![small.clone(), inactive, hidden].into();
+    let (img, drawn, reference) = occlusion_render(&p, cid);
+    assert_eq!(drawn.len(), 2, "the inactive solid and the smallest layer above it both draw");
+    assert_same_bits(&img, &reference);
+    assert_eq!(img.get(0, 0), [1.0, 0.0, 0.0, 1.0], "the lowest layer's red shows");
+    assert_eq!(img.get(100, 50), [0.0, 0.0, 1.0, 1.0]);
+}
+
+/// An inactive full-covering solid must not hide the layers under it.
+#[test]
+fn occlusion_draws_through_an_inactive_covering_solid() {
+    let (mut p, cid, comp) = setup();
+    p.settings.bit_depth = effectcraft_project::BitDepth::Bpc8;
+    let bottom = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+    let mut inactive = solid(&mut p, &comp, [0.0, 1.0, 0.0], 200, 100);
+    inactive.name = "Off".into();
+    inactive.switches.video = false;
+    p.comp_mut(cid).unwrap().layers = vec![inactive, bottom.clone()].into();
+    let (img, drawn, reference) = occlusion_render(&p, cid);
+    assert_eq!(drawn, vec![bottom.name.clone()], "only the lower layer draws");
+    assert_same_bits(&img, &reference);
+    assert_eq!(img.get(0, 0), [1.0, 0.0, 0.0, 1.0]);
+}
+
+/// CPU fallback frames under Backend::Auto skip the layers under an opaque full-frame solid,
+/// with the same pixels; a full-frame region of interest never culls.
 #[test]
 fn cpu_and_auto_fallback_frames_cull_occluded_layers() {
     struct CountAccel(std::sync::atomic::AtomicUsize);
