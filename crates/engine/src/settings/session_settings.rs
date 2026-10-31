@@ -222,11 +222,17 @@ impl Session {
 
     /// Refresh the crash-recovery sentinel (when one is active).
     pub fn update_sentinel(&self) {
-        if let Some(c) = &self.config
-            && self.autosave.sentinel
-        {
-            let s = Sentinel { pid: autosave::pid(), project: self.path.clone(), autosave: self.autosave.last_path.clone(), dirty: self.is_dirty() };
-            autosave::update(c.as_ref(), &s);
+        let _ = self.publish_sentinel();
+    }
+
+    /// Refresh the crash-recovery sentinel (when one is active), reporting a failed write.
+    pub(crate) fn publish_sentinel(&self) -> Result<()> {
+        match &self.config {
+            Some(c) if self.autosave.sentinel => {
+                let s = Sentinel { pid: autosave::pid(), project: self.path.clone(), autosave: self.autosave.last_path.clone(), dirty: self.is_dirty() };
+                autosave::try_update(c.as_ref(), &s).map_err(|e| EngineError::Other(format!("recovery record not updated: {e}")))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -287,6 +293,17 @@ impl Session {
             self.commit_autosave(path.clone(), plan.slot, self.revision);
         }
         Ok(path)
+    }
+
+    /// Checkpoint the current edits and publish their recovery record, for a render that must not
+    /// start without them. Failure never touches the saved project; the edits stay in memory and dirty.
+    pub(crate) fn checkpoint_before_render(&mut self) -> Result<()> {
+        self.autosave_now()?;
+        self.autosave_wait()?;
+        if self.autosave.saved_revision != Some(self.revision) {
+            return Err(EngineError::Other("the recovery checkpoint does not hold the current edits".into()));
+        }
+        self.publish_sentinel()
     }
 
     /// Advance recovery bookkeeping only for a successfully written snapshot.

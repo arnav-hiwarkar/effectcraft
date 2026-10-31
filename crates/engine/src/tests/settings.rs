@@ -677,6 +677,7 @@ struct AutosaveTestStore {
     release_on_prefs: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     fail_reset_for: std::sync::Mutex<Option<String>>,
     failed_resets: std::sync::atomic::AtomicUsize,
+    fail_sentinel_writes: std::sync::atomic::AtomicBool,
 }
 
 impl ConfigStore for AutosaveTestStore {
@@ -690,6 +691,9 @@ impl ConfigStore for AutosaveTestStore {
             && let Some(release) = self.release_on_prefs.lock().unwrap().take()
         {
             release.send(()).unwrap();
+        }
+        if name == autosave::SENTINEL && self.fail_sentinel_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected recovery record write failure"));
         }
         if name == autosave::SENTINEL
             && let Some(path) = self.fail_reset_for.lock().unwrap().as_ref()
@@ -743,6 +747,7 @@ fn background_autosave_session(dir: &std::path::Path) -> (Session, Arc<AutosaveT
         release_on_prefs: Default::default(),
         fail_reset_for: Default::default(),
         failed_resets: Default::default(),
+        fail_sentinel_writes: Default::default(),
     });
     let mut s = session_with_comp();
     s.config = Some(store.clone());
@@ -890,6 +895,49 @@ fn render_checkpoint_failure_preserves_work_and_retry_checkpoints_before_export(
     let mut reopened = Session::default();
     reopened.execute("file.open", json!({"path": s.autosave.last_path.clone().unwrap()})).unwrap();
     assert!(reopened.active_comp().unwrap().layers.iter().any(|l| l.name == "unsaved work"));
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn render_checkpoint_without_published_recovery_record_does_not_start_render() {
+    let dir = tmp("render-record");
+    let (mut s, store) = background_autosave_session(&dir);
+    s.prefs.auto_save.save_on_render_start = true;
+    let mock = Arc::new(crate::rq_tests::MockExporter { log: Default::default() });
+    s.exporter = Some(mock.clone());
+    let original = dir.join("Original.ecproj");
+    s.execute("file.saveAs", json!({"path": original.to_string_lossy()})).unwrap();
+    s.execute("layer.newNull", json!({"name": "unsaved work"})).unwrap();
+    std::fs::create_dir_all(dir.join("render")).unwrap();
+    s.execute("renderQueue.add", json!({"output": dir.join("render/out.mp4").to_string_lossy()})).unwrap();
+
+    let original_bytes = std::fs::read(&original).unwrap();
+    let sentinel = store.read(autosave::SENTINEL);
+
+    // The snapshot lands, but the recovery record naming it cannot be written.
+    store.fail_sentinel_writes.store(true, std::sync::atomic::Ordering::SeqCst);
+    let error = s.execute("renderQueue.render", json!({"wait": true})).unwrap_err().to_string();
+    assert!(error.contains("Render not started"), "{error}");
+    assert!(error.contains("injected recovery record write failure"), "{error}");
+    assert!(error.contains("Check the auto-save folder"), "{error}");
+    assert!(mock.log.lock().unwrap().is_empty(), "no item is exported without a published checkpoint");
+    assert!(s.render_job.is_none(), "no render job is created");
+    assert_eq!(s.project.render_queue[0].status.label(), "Queued");
+    assert!(s.is_dirty());
+    assert!(s.active_comp().unwrap().layers.iter().any(|l| l.name == "unsaved work"));
+    assert_eq!(std::fs::read(&original).unwrap(), original_bytes, "the saved project is untouched");
+    assert_eq!(store.read(autosave::SENTINEL), sentinel, "the recovery record was not replaced");
+
+    store.fail_sentinel_writes.store(false, std::sync::atomic::Ordering::SeqCst);
+    let result = s.execute("renderQueue.render", json!({"wait": true})).unwrap();
+    assert_eq!(result["items"].as_array().unwrap().len(), 1);
+    assert_eq!(mock.log.lock().unwrap().len(), 1);
+    let record: autosave::Sentinel = serde_json::from_str(&store.read(autosave::SENTINEL).unwrap()).unwrap();
+    let mut reopened = Session::default();
+    reopened.execute("file.open", json!({"path": record.autosave.unwrap()})).unwrap();
+    assert!(reopened.active_comp().unwrap().layers.iter().any(|l| l.name == "unsaved work"));
+    assert_eq!(std::fs::read(&original).unwrap(), original_bytes, "rendering does not write the saved project");
 
     std::fs::remove_dir_all(dir).unwrap();
 }

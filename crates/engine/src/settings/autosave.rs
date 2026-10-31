@@ -248,7 +248,12 @@ pub fn pid() -> u32 {
 
 /// Record the current project / latest auto-save in the sentinel.
 pub fn update(store: &dyn ConfigStore, s: &Sentinel) {
-    let _ = store.write(SENTINEL, &serde_json::to_string(s).unwrap_or_default());
+    let _ = try_update(store, s);
+}
+
+/// [`update`], reporting a failed write.
+pub fn try_update(store: &dyn ConfigStore, s: &Sentinel) -> std::io::Result<()> {
+    store.write(SENTINEL, &serde_json::to_string(s).unwrap_or_default())
 }
 
 /// Clean exit: remove the sentinel.
