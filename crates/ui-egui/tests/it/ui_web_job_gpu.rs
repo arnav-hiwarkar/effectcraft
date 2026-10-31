@@ -6,9 +6,80 @@
 use std::sync::{Arc, Mutex};
 
 use effectcraft_engine::Session;
+use effectcraft_engine::effects::Buf;
+use effectcraft_engine::effects::psim::ParticleSim;
 use effectcraft_engine::offload::{Inbox, Offload, Post, WorkerReply, WorkerRequest};
+use effectcraft_engine::project::ItemId;
+use effectcraft_engine::raster::Image;
+use effectcraft_engine::render::three_d::adv;
+use effectcraft_engine::render::{Accelerator, AutoPick, FxStep, Renderer};
+use effectcraft_engine::time::Tick;
 use effectcraft_gpu::Gpu;
 use serde_json::json;
+
+/// [`Gpu`] as a worker's accelerator, with its software classification set by the test. The
+/// export drops a software device (`Cx::new`) and renders on the CPU, so on a machine whose only
+/// adapter is a software rasteriser (llvmpipe on CI) the deferred passes these tests check would
+/// never run. `software: false` reports the device as hardware; everything else is the device's.
+struct Reporting {
+    gpu: Gpu,
+    software: bool,
+}
+
+fn worker_gpu(gpu: &Gpu, software: bool) -> Arc<dyn Accelerator> {
+    Arc::new(Reporting { gpu: gpu.clone(), software })
+}
+
+impl Accelerator for Reporting {
+    fn name(&self) -> String {
+        self.gpu.name()
+    }
+    fn available(&self) -> bool {
+        self.gpu.available()
+    }
+    fn is_software(&self) -> bool {
+        self.software
+    }
+    fn comp_frame(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<Image> {
+        self.gpu.comp_frame(r, comp, t)
+    }
+    fn comp_frame_yuv420(&self, r: &Renderer, comp: ItemId, t: Tick, bg: [f32; 3]) -> Option<Vec<u8>> {
+        self.gpu.comp_frame_yuv420(r, comp, t, bg)
+    }
+    fn supports_effect(&self, id: &str) -> bool {
+        self.gpu.supports_effect(id)
+    }
+    fn effects(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<Buf> {
+        self.gpu.effects(chain, buf, levels)
+    }
+    fn raster_3d(&self, scene: &adv::Scene) -> Option<adv::Target> {
+        self.gpu.raster_3d(scene)
+    }
+    fn render_3d(&self, run: &adv::Prepared) -> Option<adv::Rendered> {
+        self.gpu.render_3d(run)
+    }
+    fn particles(&self) -> Option<&dyn ParticleSim> {
+        self.gpu.particles()
+    }
+    fn auto_pick(&self) -> Option<&AutoPick> {
+        self.gpu.auto_pick()
+    }
+    fn frame_begin(&self) {
+        self.gpu.frame_begin()
+    }
+    fn pass_begin(&self) {
+        self.gpu.pass_begin()
+    }
+    fn pass_missed(&self) -> bool {
+        self.gpu.pass_missed()
+    }
+    fn miss_gate(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        self.gpu.miss_gate()
+    }
+    fn settle(&self) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>> {
+        self.gpu.settle()
+    }
+}
 
 /// Holds offloaded jobs until the test runs them.
 #[derive(Default)]
@@ -29,11 +100,11 @@ fn exporter(files: Files) -> Arc<effectcraft_host::FileExporter> {
     Arc::new(effectcraft_host::FileExporter { sink: Some(sink) })
 }
 
-/// Run `req` on a worker session (`gpu`: its accelerator); its replies and the files it wrote.
-fn run(req: WorkerRequest, gpu: Option<&Gpu>) -> (Vec<WorkerReply>, Vec<(String, Vec<u8>)>) {
+/// Run `req` on a worker session (`accel`: its accelerator); its replies and the files it wrote.
+fn run(req: WorkerRequest, accel: Option<Arc<dyn Accelerator>>) -> (Vec<WorkerReply>, Vec<(String, Vec<u8>)>) {
     let files: Files = Arc::default();
     let mut w = Session { exporter: Some(exporter(files.clone())), ..Default::default() };
-    w.accel = gpu.map(|g| Arc::new(g.clone()) as Arc<dyn effectcraft_engine::render::Accelerator>);
+    w.accel = accel;
     let replies = Arc::new(Mutex::new(vec![]));
     let r2 = replies.clone();
     let post: Post = std::rc::Rc::new(move |r| r2.lock().unwrap().push(r));
@@ -70,7 +141,7 @@ fn render_queue_jobs_render_on_the_worker_gpu() {
     let (req, _) = off.0.lock().unwrap().pop().expect("the render went to the worker");
     let (cpu_replies, mut cpu_files) = run(req.clone(), None);
     let before = g.deferred_stats().unwrap();
-    let (gpu_replies, mut gpu_files) = run(req, Some(&g));
+    let (gpu_replies, mut gpu_files) = run(req, Some(worker_gpu(&g, false)));
     // (the CPU worker writes a batch's files in parallel)
     cpu_files.sort();
     gpu_files.sort();
@@ -96,6 +167,33 @@ fn render_queue_jobs_render_on_the_worker_gpu() {
     }
 }
 
+/// A software device (llvmpipe, WARP, SwiftShader) is not a GPU for export: the worker's job
+/// renders on the CPU, with no deferred passes or readbacks, and the same frames as a CPU worker.
+#[test]
+fn software_worker_gpu_falls_back_to_the_cpu() {
+    let _gpu = crate::gpu_test::lock();
+    let Some(g) = Gpu::headless_deferred() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let (mut s, off) = page();
+    s.execute("renderQueue.add", json!({"format": "png", "output": "/job/f_[#####].png"})).unwrap();
+    s.execute("renderQueue.render", json!({"wait": false})).unwrap();
+    let (req, _) = off.0.lock().unwrap().pop().expect("the render went to the worker");
+    let (cpu_replies, mut cpu_files) = run(req.clone(), None);
+    let before = g.deferred_stats().unwrap();
+    let (sw_replies, mut sw_files) = run(req, Some(worker_gpu(&g, true)));
+    let after = g.deferred_stats().unwrap();
+    cpu_files.sort();
+    sw_files.sort();
+    let done = |r: &[WorkerReply]| r.iter().any(|r| matches!(r, WorkerReply::Item { update } if format!("{update:?}").contains("Done")));
+    assert!(done(&cpu_replies) && done(&sw_replies), "{sw_replies:?}");
+    assert!(matches!(sw_replies.last(), Some(WorkerReply::Done)));
+    assert_eq!(before, after, "the software device rendered nothing in passes");
+    assert_eq!(cpu_files.len(), 6);
+    assert_eq!(cpu_files, sw_files, "the software fallback writes what a CPU worker writes");
+}
+
 #[test]
 fn analyses_render_their_input_on_the_worker_gpu() {
     let _gpu = crate::gpu_test::lock();
@@ -111,7 +209,7 @@ fn analyses_render_their_input_on_the_worker_gpu() {
     let (req, _) = off.0.lock().unwrap().pop().expect("the analysis went to the worker");
     let (cpu, _) = run(req.clone(), None);
     let before = g.deferred_stats().unwrap();
-    let (gpu, _) = run(req, Some(&g));
+    let (gpu, _) = run(req, Some(worker_gpu(&g, false)));
     let after = g.deferred_stats().unwrap();
     let group = |r: &[WorkerReply]| r.iter().find_map(|r| if let WorkerReply::Group { group, .. } = r { Some(group.clone()) } else { None });
     let failed = |r: &[WorkerReply]| r.iter().find_map(|r| if let WorkerReply::Failed { error } = r { Some(error.clone()) } else { None });
