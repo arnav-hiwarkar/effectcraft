@@ -375,8 +375,7 @@ fn radial_scale_wipe(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let reverse = ctx.params.b("reverse");
     let maxd = max_corner_dist(&b, c, f64::hypot);
     let hole = done * maxd;
-    let src = b.img.clone();
-    b.img = remap(&src, false, |x, y| {
+    b.img = remap(&b.img, false, |x, y| {
         let (dx, dy) = (x - c.0, y - c.1);
         let r = dx.hypot(dy);
         if reverse {
@@ -405,8 +404,7 @@ fn scale_wipe(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let c = b.to_px(ctx.params.v2("center"));
     let a = ctx.params.f("direction").to_radians();
     let dir = (a.sin(), -a.cos());
-    let src = b.img.clone();
-    b.img = remap(&src, true, |x, y| {
+    b.img = remap(&b.img, true, |x, y| {
         let u = (x - c.0) * dir.0 + (y - c.1) * dir.1;
         if u <= 0.0 {
             return Some((x, y));
