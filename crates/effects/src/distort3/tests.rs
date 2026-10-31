@@ -251,6 +251,20 @@ fn power_pin_unstretch_expands_pinned_region() {
 }
 
 #[test]
+fn power_pin_avoids_redundant_clone_and_handles_empty_image() {
+    let empty = Image::new(0, 0);
+    let out_empty = run("ec.distort.ccpowerpin", &[], empty, &[]);
+    assert_eq!((out_empty.img.width, out_empty.img.height), (0, 0));
+    assert!(out_empty.img.data.is_empty());
+
+    let im = img(30, 20);
+    let out = run("ec.distort.ccpowerpin", &[("topLeft", pt(5.0, 2.0))], im.clone(), &[]);
+    assert_eq!((out.img.width, out.img.height), (im.width, im.height));
+    assert_eq!(out.img.data.len(), 30 * 20);
+    assert!(out.img.data.iter().any(|p| p[3] > 0.0));
+}
+
+#[test]
 fn split_opens_a_gap() {
     let im = img(40, 30);
     let o = run("ec.distort.ccsplit", &[("split", num(40.0))], im.clone(), &[]);

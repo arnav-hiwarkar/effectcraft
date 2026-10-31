@@ -249,7 +249,8 @@ fn cc_power_pin(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let persp = (ctx.params.f("perspective") / 100.0).clamp(0.0, 1.0);
     let fwd = Mat3::square_to_quad(q);
     let Some(inv) = fwd.inverse() else { return b };
-    let src = b.img.clone();
+    // Move the source out instead of cloning: nothing reads `b.img` until the new image is assigned.
+    let src = std::mem::take(&mut b.img);
     let (sc, off) = (b.scale, b.offset);
     let bil = move |u: f64, v: f64| -> (f64, f64) {
         let top = (q[0].x + (q[1].x - q[0].x) * u, q[0].y + (q[1].y - q[0].y) * u);
