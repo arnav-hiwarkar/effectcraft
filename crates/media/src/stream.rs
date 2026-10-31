@@ -102,10 +102,15 @@ pub(crate) fn file_reader(_path: &Path) -> Option<Box<dyn filmcraft_media::ByteR
 /// more than 64 MiB, including their headers.
 #[cfg(any(unix, windows))]
 pub(crate) fn movie_header(path: &Path) -> Option<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-    const MAX_HEADER: usize = 64 << 20;
-    let mut f = std::fs::File::open(path).ok()?;
+    let f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
+    movie_header_from(f, len)
+}
+
+#[cfg(any(unix, windows))]
+fn movie_header_from<F: std::io::Read + std::io::Seek>(mut f: F, len: u64) -> Option<Vec<u8>> {
+    use std::io::SeekFrom;
+    const MAX_HEADER: usize = 64 << 20;
     let mut out = Vec::new();
     let mut pos = 0u64;
     for _ in 0..4096 {
@@ -181,7 +186,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::movie_header;
+    use super::{movie_header, movie_header_from};
 
     struct TempMovie(PathBuf);
 
@@ -205,6 +210,11 @@ mod tests {
             Ok(movie)
         }
 
+        // Most fixtures here are sparse files tens of MiB in size (`set_len` writes blocks of
+        // logical bytes, not real data): cheap on disk, but every `read_exact` over an
+        // unbacked region is still zero-filled through the page cache, so tests that walk
+        // whole payload boxes touch 64 MiB of resident pages each run. Keep payloads unread
+        // whenever the size assertion allows it (the pre-read test does exactly that).
         fn boxes(boxes: &[(u32, &[u8; 4])]) -> io::Result<Self> {
             let (movie, mut file) = Self::new()?;
             let mut offset = 0u64;
@@ -222,6 +232,21 @@ mod tests {
     impl Drop for TempMovie {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    // A reader that counts payload bytes it is handed, for the pre-read regression below.
+    struct Counting<'a>(&'a std::cell::Cell<u64>, &'a File);
+    impl std::io::Seek for Counting<'_> {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> io::Result<u64> {
+            self.1.seek(pos)
+        }
+    }
+    impl std::io::Read for Counting<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.1.read(buf)?;
+            self.0.set(self.0.get() + n as u64);
+            Ok(n)
         }
     }
 
@@ -257,6 +282,21 @@ mod tests {
             let movie = TempMovie::bytes(bytes)?;
             assert!(movie_header(&movie.0).is_none());
         }
+        Ok(())
+    }
+
+    /// A box whose retained size crosses the aggregate cap is rejected before its payload is
+    /// read: the walk reads the first box in full, the crossing box's 8 header bytes, and
+    /// nothing else (its untouched 33 MiB payload would push the counter far higher).
+    #[test]
+    fn movie_header_rejects_the_box_that_crosses_the_cap_before_its_payload_read() -> io::Result<()> {
+        let movie = TempMovie::boxes(&[(33_554_440, b"ftyp"), (33_554_440, b"ftyp"), (8, b"moov")])?;
+        let file = File::open(&movie.0)?;
+        let len = file.metadata()?.len();
+        let seen = std::cell::Cell::new(0u64);
+        let header = movie_header_from(Counting(&seen, &file), len);
+        assert!(header.is_none());
+        assert_eq!(seen.get(), 8 + 33_554_440 + 8, "the crossing box's payload must not be read");
         Ok(())
     }
 }
