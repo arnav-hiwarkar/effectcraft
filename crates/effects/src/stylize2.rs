@@ -976,7 +976,7 @@ mod tests {
         let avg = run_at("ec.stylize.mosaic", &[("horizontal", num(2.0)), ("vertical", num(1.0))], img.clone(), 0.0);
         let sharp = run_at("ec.stylize.mosaic", &[("horizontal", num(2.0)), ("vertical", num(1.0)), ("sharpColors", Value::Bool(true))], img.clone(), 0.0);
         for y in 0..10 {
-            for x in 0..10 {
+            for x in 0..20 {
                 let expected_center = if x < 10 { img.get(5, 5) } else { img.get(15, 5) };
                 assert_eq!(sharp.img.get(x, y), expected_center);
                 let expected_x_avg = if x < 10 { 0.225 } else { 0.725 };
