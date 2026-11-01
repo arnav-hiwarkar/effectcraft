@@ -1560,7 +1560,7 @@ fn matrix_dependency_scene(parent_x: f64, unrelated_x: f64, self_x: f64) -> (Pro
         let pr = l.props.prop_mut("transform/position").unwrap();
         pr.value = Value::Vec3([x, 0.0, 0.0]);
     }
-    p.comp_mut(cid).unwrap().layers = vec![owner, selfish, child, parent, unrelated];
+    p.comp_mut(cid).unwrap().layers = vec![owner, selfish, child, parent, unrelated].into();
     (p, cid)
 }
 
