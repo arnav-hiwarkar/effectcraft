@@ -484,11 +484,11 @@ mod tests {
 
         let comp_samples = with(&[("viewingMode", Value::Enum(2))]);
         assert_ne!(comp_samples, base);
-        assert!(comp_samples.data.iter().any(|p| *p == [1.0, 1.0, 0.0, 1.0]));
+        assert!(comp_samples.data.contains(&[1.0, 1.0, 0.0, 1.0]));
 
         let noise_samples = with(&[("viewingMode", Value::Enum(1))]);
         assert_ne!(noise_samples, base);
-        assert!(noise_samples.data.iter().any(|p| *p == [1.0, 1.0, 0.0, 1.0]));
+        assert!(noise_samples.data.contains(&[1.0, 1.0, 0.0, 1.0]));
 
         let matte = with(&[("viewingMode", Value::Enum(3))]);
         assert_ne!(matte, base);
