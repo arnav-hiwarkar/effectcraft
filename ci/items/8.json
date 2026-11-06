@@ -1,0 +1,12 @@
+{
+  "id": "8",
+  "source_head": "8fd36e20c782c52a5104e6996df20d401e41bcbe",
+  "github_branch": "perf/8",
+  "focus": "draft",
+  "named_filters": [
+    {
+      "package": "effectcraft-engine",
+      "test": "tests_thumbnail_release"
+    }
+  ]
+}

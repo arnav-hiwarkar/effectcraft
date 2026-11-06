@@ -1,0 +1,24 @@
+{
+ "id": "46",
+ "source_head": "ad12a375789246b4f4147489e8c88e70d7c6920e",
+ "github_branch": "perf/46",
+ "focus": "draft",
+ "named_filters": [
+  {
+   "package": "effectcraft-engine",
+   "test": "offloaded_requests_carry_compact_project"
+  },
+  {
+   "package": "effectcraft-engine",
+   "test": "render_runs_through_the_offload"
+  },
+  {
+   "package": "effectcraft-engine",
+   "test": "track_analysis_runs_through_the_offload_as_one_undo_step"
+  },
+  {
+   "package": "effectcraft-engine",
+   "test": "offload"
+  }
+ ]
+}

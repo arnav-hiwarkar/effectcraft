@@ -1,0 +1,20 @@
+{
+ "id": "40",
+ "source_head": "026bf6d854bb61556b93d140ccb02f247ae53270",
+ "github_branch": "perf/40",
+ "focus": "draft",
+ "named_filters": [
+  {
+   "package": "effectcraft-engine",
+   "test": "salt_recomputed_only_when_footage_changes"
+  },
+  {
+   "package": "effectcraft-engine",
+   "test": "tests_disk_cache"
+  },
+  {
+   "package": "effectcraft-engine",
+   "test": "footage_reload"
+  }
+ ]
+}

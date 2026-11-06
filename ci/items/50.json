@@ -1,0 +1,12 @@
+{
+ "id": "50",
+ "source_head": "e7e185d7b747afaf893824759cc8112f4dba510d",
+ "github_branch": "perf/50",
+ "focus": "draft",
+ "named_filters": [
+  {
+   "package": "effectcraft-render",
+   "test": "dependency_key_follows_parent_matrix_not_text"
+  }
+ ]
+}

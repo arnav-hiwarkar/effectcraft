@@ -1,0 +1,16 @@
+{
+ "id": "47",
+ "source_head": "c9c2c23c70f2be6572b35f5ad52ac89045b51af7",
+ "github_branch": "perf/47",
+ "focus": "draft",
+ "named_filters": [
+  {
+   "package": "effectcraft-effects",
+   "test": "params_key"
+  },
+  {
+   "package": "effectcraft-effects",
+   "test": "sim"
+  }
+ ]
+}
