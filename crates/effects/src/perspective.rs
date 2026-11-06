@@ -130,7 +130,7 @@ fn radial_shadow(ctx: &EffectCtx, mut b: Buf) -> Buf {
         b.pad((grow + soft * 1.5).ceil() as u32 + 1);
     }
     let l = b.to_px(lp0);
-    let src = b.img.clone();
+    let src = std::mem::take(&mut b.img);
     let mut sh = Image::new(src.width, src.height);
     sh.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
@@ -542,6 +542,36 @@ mod tests {
         let s = out.get(30, 21);
         assert!(s[3] > 0.9 && s[0] < 0.05, "{s:?}");
         assert_eq!(out.get(30, 5)[3], 0.0);
+    }
+
+    #[test]
+    fn radial_shadow_preserves_output_and_handles_shadow_only() {
+        let empty = Image::new(0, 0);
+        let out_empty = run("ec.perspective.radialshadow", &empty, &[]).img;
+        assert_eq!(out_empty.width, 0);
+        assert_eq!(out_empty.height, 0);
+        assert!(out_empty.data.is_empty());
+
+        let img = square(60, 60, 25, [1.0, 0.0, 0.0]);
+        let normal = run(
+            "ec.perspective.radialshadow",
+            &img,
+            &[("lightSource", Value::Vec2([30.0, 30.0])), ("projectionDistance", num(100.0)), ("opacity", num(100.0)), ("shadowOnly", Value::Bool(false))],
+        )
+        .img;
+        assert_eq!(normal.get(30, 30), [1.0, 0.0, 0.0, 1.0]);
+        let s_normal = normal.get(30, 21);
+        assert!(s_normal[3] > 0.9 && s_normal[0] < 0.05, "{s_normal:?}");
+
+        let shadow_only = run(
+            "ec.perspective.radialshadow",
+            &img,
+            &[("lightSource", Value::Vec2([30.0, 30.0])), ("projectionDistance", num(100.0)), ("opacity", num(100.0)), ("shadowOnly", Value::Bool(true))],
+        )
+        .img;
+        assert_eq!(shadow_only.get(30, 30), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(shadow_only.get(30, 21), s_normal);
+        assert_eq!(shadow_only.get(30, 5)[3], 0.0);
     }
 
     #[test]
