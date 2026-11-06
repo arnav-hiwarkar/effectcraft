@@ -7,7 +7,7 @@ use effectcraft_keyframe::Value;
 use effectcraft_project::ParamUi;
 use rayon::prelude::*;
 
-use crate::util::{layer_or_self, lerp4, premul, unpremul};
+use crate::util::{fit_layer, layer_or_self, lerp4, premul, unpremul};
 use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
@@ -27,12 +27,15 @@ const SIZE_DIFF: [&str; 2] = ["Center", "Stretch to Fit"];
 // ---------------------------------------------------------------- Blend
 
 fn blend(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let mode = ctx.params.e("mode");
     let orig = (ctx.params.f("blendWithOriginal") as f32 / 100.0).clamp(0.0, 1.0);
     if orig >= 1.0 {
         return b;
     }
-    let other = layer_or_self(ctx, &b, "blendWithLayer", true, ctx.params.e("ifLayerSizesDiffer") == 1);
+    let Some(layer) = ctx.layer_param("blendWithLayer", true) else {
+        return b;
+    };
+    let mode = ctx.params.e("mode");
+    let other = fit_layer(ctx, &b, &layer, ctx.params.e("ifLayerSizesDiffer") == 1);
     b.img.data.par_iter_mut().zip(other.data.par_iter()).for_each(|(px, &o)| {
         let src = *px;
         let blended = match mode {
@@ -127,8 +130,11 @@ fn calculations(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let in_ch = ctx.params.e("inputChannel");
     let in_inv = ctx.params.b("invertInput");
     let second = ctx.params.get("secondLayer").and_then(Value::as_layer).is_some();
-    let sec_ch = ctx.params.e("secondLayerChannel");
     let sec_op = (ctx.params.f("secondLayerOpacity") as f32 / 100.0).clamp(0.0, 1.0);
+    if in_ch == 0 && !in_inv && (!second || sec_op == 0.0) {
+        return b;
+    }
+    let sec_ch = ctx.params.e("secondLayerChannel");
     let sec_inv = ctx.params.b("invertSecondLayer");
     let mode = CALC_MODES[(ctx.params.e("blendingMode") as usize).min(CALC_MODES.len() - 1)];
     let keep_alpha = ctx.params.b("preserveTransparency");
@@ -260,32 +266,46 @@ fn overflow(op: u32, v: f32, how: u32) -> f32 {
     }
 }
 
+#[inline]
+fn compute_arith(c: [f32; 3], a: f32, oc: [f32; 3], oa: f32, op: u32, chans: u32, how: u32) -> [f32; 4] {
+    let mut rc = c;
+    let mut ra = a;
+    if chans != 2 {
+        for k in 0..3 {
+            rc[k] = overflow(op, arith(op, c[k], oc[k]), how);
+        }
+    }
+    if chans != 0 {
+        ra = overflow(op, arith(op, a, oa), how);
+    }
+    premul(rc, ra)
+}
+
 fn compound_arithmetic(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let op = ctx.params.e("operator");
-    let chans = ctx.params.e("operateOnChannels");
-    let how = ctx.params.e("overflowBehavior");
     let orig = (ctx.params.f("blendWithOriginal") as f32 / 100.0).clamp(0.0, 1.0);
     if orig >= 1.0 {
         return b;
     }
-    let other = layer_or_self(ctx, &b, "secondSource", true, ctx.params.b("stretchSecondSourceToFit"));
-    b.img.data.par_iter_mut().zip(other.data.par_iter()).for_each(|(px, &o)| {
-        let src = *px;
-        let (c, a) = unpremul(src);
-        let (oc, oa) = unpremul(o);
-        let mut rc = c;
-        let mut ra = a;
-        if chans != 2 {
-            for k in 0..3 {
-                rc[k] = overflow(op, arith(op, c[k], oc[k]), how);
-            }
-        }
-        if chans != 0 {
-            ra = overflow(op, arith(op, a, oa), how);
-        }
-        let res = premul(rc, ra);
-        *px = lerp4(res, src, orig);
-    });
+    let op = ctx.params.e("operator");
+    let chans = ctx.params.e("operateOnChannels");
+    let how = ctx.params.e("overflowBehavior");
+    if let Some(layer) = ctx.layer_param("secondSource", true) {
+        let other = fit_layer(ctx, &b, &layer, ctx.params.b("stretchSecondSourceToFit"));
+        b.img.data.par_iter_mut().zip(other.data.par_iter()).for_each(|(px, &o)| {
+            let src = *px;
+            let (c, a) = unpremul(src);
+            let (oc, oa) = unpremul(o);
+            let res = compute_arith(c, a, oc, oa, op, chans, how);
+            *px = lerp4(res, src, orig);
+        });
+    } else {
+        b.img.data.par_iter_mut().for_each(|px| {
+            let src = *px;
+            let (c, a) = unpremul(src);
+            let res = compute_arith(c, a, c, a, op, chans, how);
+            *px = lerp4(res, src, orig);
+        });
+    }
     b
 }
 
@@ -400,6 +420,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn blend_self_no_allocation_and_identity() {
+        let img = sample();
+        for mode in 0..5 {
+            let out = run_fx("ec.channel.blend", &[("mode", Value::Enum(mode))], img.clone(), 0.0, EffectEnv::default());
+            assert_eq!(out.img.data, img.data, "mode {mode} did not return identical output on self-source");
+        }
+        let red = Image::filled(8, 6, [1.0, 0.0, 0.0, 1.0]);
+        let out = with_host(red, |env| {
+            run_fx("ec.channel.blend", &[("blendWithLayer", Value::Layer(Some(7))), ("blendWithOriginal", num(50.0))], img.clone(), 0.0, env)
+        });
+        let p = out.img.get(0, 0);
+        assert!((p[0] - 0.5).abs() < 1e-5 && (p[3] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
     fn calculations_defaults_identity_and_gray() {
         let img = sample();
         let out = run_fx("ec.channel.calculations", &[], img.clone(), 0.0, EffectEnv::default());
@@ -412,6 +447,48 @@ pub(crate) mod tests {
         });
         let q = m.img.get(4, 0);
         assert!((q[0] - 0.25).abs() < 1e-4, "{q:?}");
+    }
+
+    #[test]
+    fn calculations_identity_early_return() {
+        let img = sample();
+        let out_no_second =
+            run_fx("ec.channel.calculations", &[("inputChannel", Value::Enum(0)), ("invertInput", Value::Bool(false))], img.clone(), 0.0, EffectEnv::default());
+        assert_eq!(out_no_second.img.data, img.data);
+
+        let other = Image::filled(8, 6, [0.8, 0.2, 0.5, 1.0]);
+        let out_zero_op = with_host(other.clone(), |env| {
+            run_fx(
+                "ec.channel.calculations",
+                &[
+                    ("inputChannel", Value::Enum(0)),
+                    ("invertInput", Value::Bool(false)),
+                    ("secondLayer", Value::Layer(Some(7))),
+                    ("secondLayerOpacity", num(0.0)),
+                ],
+                img.clone(),
+                0.0,
+                env,
+            )
+        });
+        assert_eq!(out_zero_op.img.data, img.data);
+
+        let out_active = with_host(other, |env| {
+            run_fx(
+                "ec.channel.calculations",
+                &[
+                    ("inputChannel", Value::Enum(0)),
+                    ("invertInput", Value::Bool(false)),
+                    ("secondLayer", Value::Layer(Some(7))),
+                    ("secondLayerOpacity", num(100.0)),
+                    ("blendingMode", Value::Enum(2)),
+                ],
+                img.clone(),
+                0.0,
+                env,
+            )
+        });
+        assert_ne!(out_active.img.data, img.data);
     }
 
     #[test]
@@ -444,6 +521,18 @@ pub(crate) mod tests {
             )
         });
         assert!((sc.img.get(4, 3)[0] - 0.75).abs() < 1e-5);
+    }
+
+    #[test]
+    fn compound_arithmetic_self_no_clone_and_parity() {
+        let img = sample();
+        for &op in &[0, 1, 3, 4] {
+            let out_self = run_fx("ec.channel.compoundarithmetic", &[("operator", Value::Enum(op))], img.clone(), 0.0, EffectEnv::default());
+            let out_explicit = with_host(img.clone(), |env| {
+                run_fx("ec.channel.compoundarithmetic", &[("secondSource", Value::Layer(Some(7))), ("operator", Value::Enum(op))], img.clone(), 0.0, env)
+            });
+            assert_eq!(out_self.img.data, out_explicit.img.data, "operator {op} mismatch between self-source and duplicate layer host");
+        }
     }
 }
 
