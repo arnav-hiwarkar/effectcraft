@@ -1,27 +1,68 @@
-name: CI
-
-# Quality gates for every push to main and every pull request (`cargo xtask ci`), through the
-# suite's shared gate workflow in craft-common-actions.
+name: Release audit
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
-
 permissions:
   contents: read
-
-# A newer push to a PR branch cancels its older run; every push to main runs to the end.
-concurrency:
-  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  gate:
-    # Tracks @main so suite-wide CI fixes reach every app without a PR in each repository.
-    uses: storytold/craft-common-actions/.github/workflows/gate.yml@main
-    with:
-      packages: >-
-        pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libxcursor-dev
-        libxrandr-dev libxi-dev libfontconfig1-dev libfreetype-dev mesa-vulkan-drivers
-        libgl1-mesa-dev libasound2-dev
+  audit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: 1
+      CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+      CRAFT_FONTS_REQUIRED: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: storytold/effectcraft
+          ref: fb62b9d7e3ff3a4c0ee93f66b24fbd6673dbf344
+          path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: storytold/craft-fonts
+          ref: bfcbf714e45a3ea8e98f88ab2b7971372a576414
+          path: craft-fonts
+          persist-credentials: false
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        uses: storytold/craft-common-actions/actions/install-apt-packages@main
+        with:
+          packages: pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libxcursor-dev libxrandr-dev libxi-dev libfontconfig1-dev libfreetype-dev mesa-vulkan-drivers libgl1-mesa-dev libasound2-dev ffmpeg
+      - name: Rust
+        shell: bash
+        run: rustup update stable --no-self-update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: candidate -> target
+          save-if: false
+      - name: Candidate tests and release build
+        working-directory: candidate
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = fb62b9d7e3ff3a4c0ee93f66b24fbd6673dbf344
+          flags=()
+          if [ "$RUNNER_OS" = Windows ]; then flags+=(--full-tests); fi
+          python ../_release_audit/platform_audit.py --output ../audit-artifacts "${flags[@]}"
+      - name: Upload evidence and binaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-audit-${{ runner.os }}-fb62b9d7
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            audit-artifacts/
+            candidate/target/release/effectcraft
+            candidate/target/release/effectcraft-cli
+            candidate/target/release/effectcraft.exe
+            candidate/target/release/effectcraft-cli.exe
