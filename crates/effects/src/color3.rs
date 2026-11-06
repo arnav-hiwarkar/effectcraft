@@ -170,6 +170,9 @@ fn color_neutralizer(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let contrast = (ctx.params.f("contrast") / 100.0) as f32;
     let darks = (ctx.params.f("darks") / 100.0) as f32;
     let brights = (ctx.params.f("brights") / 100.0) as f32;
+    if orig >= 1.0 || (contrast == 0.0 && darks == 0.0 && brights == 0.0 && off.iter().all(|o| o[0] == 0.0 && o[1] == 0.0 && o[2] == 0.0)) {
+        return b;
+    }
     map_colour(&mut b, |_, c| {
         let l = luminance(c[0], c[1], c[2]).clamp(0.0, 1.0);
         let ws = 1.0 - smoothstep(0.0, 0.5, l);
@@ -205,8 +208,11 @@ fn parse_map(s: &str) -> Vec<f32> {
 }
 
 fn arbitrary_map(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let map = parse_map(ctx.params.s("map"));
     let phase = ctx.params.f("phase");
+    if ctx.params.s("map").trim().is_empty() && phase == 0.0 {
+        return b;
+    }
+    let map = parse_map(ctx.params.s("map"));
     let alpha = ctx.params.b("applyPhaseMapToAlpha");
     let n = map.len();
     let lookup = |v: f32| -> f32 {
@@ -928,6 +934,21 @@ mod tests {
         let out = run("ec.color.psarbitrarymap", &[("map", Value::Str(inv.join(",")))], Image::filled(2, 2, [0.25, 0.5, 1.0, 1.0]));
         let p = out.get(0, 0);
         assert!((p[0] - 0.75).abs() < 0.01 && p[2].abs() < 0.01, "{p:?}");
+    }
+
+    #[test]
+    fn color_neutralizer_and_arbitrary_map_identity_bypass() {
+        let img = ramp();
+        // Out-of-range values: the default-settings loops clamp these.
+        let hot = Image::filled(4, 4, [-0.2, 0.5, 1.5, 1.0]);
+        assert_eq!(run("ec.color.cccolorneutralizer", &[], hot.clone()).data, hot.data);
+        assert_eq!(run("ec.color.psarbitrarymap", &[], hot.clone()).data, hot.data);
+        assert_ne!(run("ec.color.psarbitrarymap", &[("phase", num(10.0))], img.clone()).data, img.data);
+        let cast = Image::filled(4, 4, [0.6, 0.5, 0.4, 1.0]);
+        let unbalance = [("midtonesUnbalance", col(0.6, 0.5, 0.4)), ("midtonesBalance", col(0.5, 0.5, 0.5))];
+        assert_ne!(run("ec.color.cccolorneutralizer", &unbalance, cast.clone()).data, cast.data);
+        let full = [("blendWOriginal", num(100.0)), ("midtonesUnbalance", col(0.6, 0.5, 0.4)), ("midtonesBalance", col(0.5, 0.5, 0.5))];
+        assert_eq!(run("ec.color.cccolorneutralizer", &full, hot.clone()).data, hot.data);
     }
 
     #[test]
