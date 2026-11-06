@@ -258,8 +258,8 @@ fn inner_outer_key(ctx: &EffectCtx, mut b: Buf) -> Buf {
     if feather > 0.05 {
         alpha = gauss_plane(&alpha, feather * 0.5, feather * 0.5);
     }
-    let src = b.img.clone();
     b.img.data.par_iter_mut().enumerate().for_each(|(i, px)| {
+        let in_px = *px;
         let mut m = alpha.data[i];
         if thr > 0.0 {
             m = if m < thr { 0.0 } else { m };
@@ -267,10 +267,10 @@ fn inner_outer_key(ctx: &EffectCtx, mut b: Buf) -> Buf {
         if invert {
             m = 1.0 - m;
         }
-        let (c0, a) = unpremul(src.data[i]);
+        let (c0, a) = unpremul(in_px);
         let c = colours.as_ref().map(|v| v[i]).unwrap_or(c0);
         let keyed = premul(c, a * m);
-        *px = lerp4(keyed, src.data[i], orig);
+        *px = lerp4(keyed, in_px, orig);
     });
     b
 }
@@ -684,5 +684,35 @@ mod tests {
         ]);
         let painted = run_fx("ec.key.innerouter", &fg, img, 0.0, env).img;
         assert!(painted.get(27, 5)[3] > 0.9 && painted.get(27, 2)[3] < 0.1);
+    }
+
+    #[test]
+    fn inner_outer_key_in_place_blend_with_original() {
+        let img = Image::filled(20, 20, [0.8, 0.2, 0.2, 1.0]);
+        let masks = vec![MaskShape { name: "Mask 1".into(), points: vec![[5.0, 5.0], [15.0, 5.0], [15.0, 15.0], [5.0, 15.0]], closed: true, inverted: false }];
+        let env = EffectEnv { masks: &masks, ..Default::default() };
+
+        // 100% blend with original should preserve input pixels completely bit-identical.
+        let out_100 = run_fx("ec.key.innerouter", &[("foreground", Value::Enum(1)), ("blendWithOriginal", num(100.0))], img.clone(), 0.0, env);
+        assert_eq!(out_100.img.data, img.data);
+
+        // 0% blend with original should fully key out background (outside mask).
+        let out_0 = run_fx("ec.key.innerouter", &[("foreground", Value::Enum(1)), ("blendWithOriginal", num(0.0))], img.clone(), 0.0, env);
+        assert!((out_0.img.get(10, 10)[3] - 1.0).abs() < 1e-6);
+        assert_eq!(out_0.img.get(1, 1)[3], 0.0);
+
+        // 50% blend with original should interpolate between keyed and original.
+        let out_50 = run_fx("ec.key.innerouter", &[("foreground", Value::Enum(1)), ("blendWithOriginal", num(50.0))], img.clone(), 0.0, env);
+        let p_keyed = out_0.img.get(1, 1);
+        let p_orig = img.get(1, 1);
+        let p_blend = out_50.img.get(1, 1);
+        for k in 0..4 {
+            let expected = 0.5 * p_keyed[k] + 0.5 * p_orig[k];
+            assert!((p_blend[k] - expected).abs() < 1e-5);
+        }
+
+        // With edgeThreshold applied, semi-transparent pixels below threshold are clamped to 0.
+        let out_thresh = run_fx("ec.key.innerouter", &[("foreground", Value::Enum(1)), ("edgeThreshold", num(90.0))], img.clone(), 0.0, env);
+        assert!((out_thresh.img.get(10, 10)[3] - 1.0).abs() < 1e-6);
     }
 }
