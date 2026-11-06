@@ -81,26 +81,52 @@ fn is_relative_name(name: &str) -> bool {
 /// writer that did not compress. Compressed entries and entries whose names are not relative
 /// paths inside the archive are skipped.
 pub fn read_stored(data: &[u8]) -> Vec<(String, Vec<u8>)> {
+    read_stored_borrowed(data).into_iter().map(|(name, bytes)| (name, bytes.to_vec())).collect()
+}
+
+/// Read stored entries with payloads borrowed from the input archive.
+pub(crate) fn read_stored_borrowed(data: &[u8]) -> Vec<(String, &[u8])> {
     let mut out = vec![];
     let mut i = 0usize;
-    let u16_at = |p: usize| data.get(p..p + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize);
-    let u32_at = |p: usize| data.get(p..p + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
-    while u32_at(i) == Some(0x0403_4b50) {
-        let (Some(method), Some(size), Some(nlen), Some(xlen)) = (u16_at(i + 8), u32_at(i + 18), u16_at(i + 26), u16_at(i + 28)) else { break };
-        let name_start = i + 30;
-        let body = name_start + nlen + xlen;
-        let (Some(name), Some(bytes)) = (data.get(name_start..name_start + nlen), data.get(body..body + size)) else { break };
+    while let Some(name_start) = i.checked_add(30) {
+        let Some(header) = data.get(i..name_start).and_then(|h| <&[u8; 30]>::try_from(h).ok()) else { break };
+        if header.get(..4) != Some(b"PK\x03\x04") {
+            break;
+        }
+        let method = u16::from_le_bytes([header[8], header[9]]);
+        let size = u32::from_le_bytes([header[18], header[19], header[20], header[21]]) as usize;
+        let nlen = u16::from_le_bytes([header[26], header[27]]) as usize;
+        let xlen = u16::from_le_bytes([header[28], header[29]]) as usize;
+        let Some(name_end) = name_start.checked_add(nlen) else { break };
+        let Some(body) = name_end.checked_add(xlen) else { break };
+        let Some(end) = body.checked_add(size) else { break };
+        let (Some(name), Some(bytes)) = (data.get(name_start..name_end), data.get(body..end)) else { break };
         let name = String::from_utf8_lossy(name).to_string();
         if method == 0 && is_relative_name(&name) {
-            out.push((name, bytes.to_vec()));
+            out.push((name, bytes));
         }
-        i = body + size;
+        i = end;
     }
     out
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stored_payloads_borrow_archive() {
+        let archive = super::store(&[("a.json".into(), b"{}".to_vec()), ("images/unused.bin".into(), b"unused".to_vec())]);
+        let entries = super::read_stored_borrowed(&archive);
+        assert_eq!(entries, [("a.json".into(), b"{}".as_slice()), ("images/unused.bin".into(), b"unused".as_slice())]);
+        let mut record = 0;
+        for ((name, payload), expected) in entries.iter().zip([b"{}".as_slice(), b"unused".as_slice()]) {
+            let body = record + 30 + name.len();
+            assert_eq!(payload.len(), expected.len());
+            assert!(std::ptr::eq(payload.as_ptr(), archive[body..].as_ptr()));
+            record = body + expected.len();
+        }
+        assert_eq!(super::read_stored(&archive), [("a.json".into(), b"{}".to_vec()), ("images/unused.bin".into(), b"unused".to_vec())]);
+    }
+
     #[test]
     fn crc_and_roundtrip() {
         assert_eq!(super::crc32(b"123456789"), 0xCBF4_3926);
