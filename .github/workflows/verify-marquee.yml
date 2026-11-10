@@ -1,0 +1,15 @@
+name: Verify marquee scroll fix
+on:
+  push:
+    branches: [verify/keyframe-marquee-scroll-51ef332c]
+permissions:
+  contents: read
+jobs:
+  gate:
+    uses: storytold/craft-common-actions/.github/workflows/gate.yml@main
+    with:
+      os: '["ubuntu-24.04", "windows-latest"]'
+      packages: >-
+        pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libxcursor-dev
+        libxrandr-dev libxi-dev libfontconfig1-dev libfreetype-dev mesa-vulkan-drivers
+        libgl1-mesa-dev libasound2-dev
