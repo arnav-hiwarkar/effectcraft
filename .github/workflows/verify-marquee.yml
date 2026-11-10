@@ -8,7 +8,13 @@ jobs:
   gate:
     uses: storytold/craft-common-actions/.github/workflows/gate.yml@main
     with:
-      os: '["ubuntu-24.04", "windows-latest"]'
+      os: '["windows-latest"]'
+      # https://github.com/storytold/craft-common-actions/issues/185
+      # Cargo must be able to replace target/debug/xtask.exe while testing the workspace.
+      windows-command: |
+        cargo build --locked --package xtask
+        cp target/debug/xtask.exe "$RUNNER_TEMP/effectcraft-verify-ci.exe"
+        "$RUNNER_TEMP/effectcraft-verify-ci.exe" ci
       packages: >-
         pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libxcursor-dev
         libxrandr-dev libxi-dev libfontconfig1-dev libfreetype-dev mesa-vulkan-drivers
