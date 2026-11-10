@@ -65,7 +65,8 @@ merges that project into the open one, inside a folder named after the file, as 
 imports an `.aep`. Every item, layer and property id moves past the open project's, so precomps,
 parents, track mattes, Layer Control values, Essential Graphics and tracker targets keep pointing
 at the right things. It is one undo step. Footage paths relative to the imported project resolve
-next to it.
+next to it. The same holds for an After Effects project, imported or opened with File ▸ Open
+([aep-import.md](aep-import.md)).
 
 Agents: `file.importProject {"path": "/projects/titles.ecproj"}` returns the comps, the root comps,
 `primaryComp` (the only root comp, if there is one) and any missing media.

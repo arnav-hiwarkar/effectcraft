@@ -403,3 +403,96 @@ fn a_video_with_sound_arrives_audible() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// File ▸ Open of an After Effects project converts it into a new, untitled project: the file's
+/// items at the top level (no folder named after it), its settings, the first composition open,
+/// nothing to undo or save, the file in Open Recent; Save never writes over it.
+#[test]
+fn open_converts_an_after_effects_project_into_an_untitled_one() {
+    use effectcraft_project::BitDepth;
+    let dir = std::env::temp_dir().join(format!("ec-open-aep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let intro = dir.join("Intro.aep").to_string_lossy().to_string();
+    let mut source = Session::default();
+    std::sync::Arc::make_mut(&mut source.project).settings.bit_depth = BitDepth::Bpc16;
+    source.execute("comp.new", json!({"name": "Intro", "width": 64, "height": 36, "frameRate": 30, "duration": 1})).unwrap();
+    source.execute("file.exportAep", json!({"path": intro, "allowLosses": true})).unwrap();
+    let original = std::fs::read(&intro).unwrap();
+
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Old", "width": 32, "height": 32, "frameRate": 30, "duration": 1})).unwrap();
+    let r = s.execute("file.open", json!({"path": intro})).unwrap();
+    assert_eq!(r["converted"], json!(true), "{r}");
+    assert!(s.project.items.values().all(|i| i.name != "Old"), "the open project was replaced");
+    assert!(s.project.items.values().all(|i| i.name != "Intro.aep"), "no folder named after the file");
+    let comp = s.project.items.values().find(|i| i.name == "Intro").expect("the composition");
+    assert_eq!(comp.parent, None, "at the top level");
+    assert_eq!(s.state.active_comp, Some(comp.id), "and open");
+    assert_eq!(s.project.settings.bit_depth, BitDepth::Bpc16, "the file's settings");
+    assert_eq!((s.path.as_deref(), s.opened_from.as_deref()), (None, Some(intro.as_str())), "untitled, converted from the file");
+    assert!(!s.is_dirty() && s.history.undo.is_empty(), "nothing to save or undo");
+    assert_eq!(s.prefs.recent_projects.first(), Some(&intro), "in Open Recent");
+    assert!(s.execute("file.save", json!({})).is_err(), "Save needs a new path");
+    assert_eq!(std::fs::read(&intro).unwrap(), original, "the file is never written");
+
+    // Opened again from Open Recent; replacing the project forgets where it came from.
+    s.execute("file.newProject", json!({})).unwrap();
+    assert_eq!(s.opened_from, None);
+    s.execute("file.openRecent", json!({"index": 0})).unwrap();
+    assert!(s.project.items.values().any(|i| i.name == "Intro") && s.opened_from.as_deref() == Some(intro.as_str()));
+
+    // Saved as an EffectCraft project, it is that project from then on.
+    let saved = dir.join("Intro.ecproj").to_string_lossy().to_string();
+    s.execute("file.saveAs", json!({"path": saved})).unwrap();
+    s.execute("file.open", json!({"path": saved})).unwrap();
+    assert_eq!((s.path.as_deref(), s.opened_from.as_deref()), (Some(saved.as_str()), None));
+
+    // The content decides, not the name: an After Effects project called .ecproj opens converted.
+    let renamed = dir.join("Renamed.ecproj");
+    std::fs::write(&renamed, &original).unwrap();
+    s.execute("file.open", json!({"path": renamed.to_string_lossy()})).unwrap();
+    assert!(s.project.items.values().any(|i| i.name == "Intro") && s.path.is_none());
+    // ... and an EffectCraft project naming the element is still one.
+    let mut own = Session::default();
+    own.execute("comp.new", json!({"name": "<AfterEffectsProject>", "width": 32, "height": 32, "frameRate": 30, "duration": 1})).unwrap();
+    let own_path = dir.join("Own.ecproj").to_string_lossy().to_string();
+    own.execute("file.saveAs", json!({"path": own_path})).unwrap();
+    s.execute("file.open", json!({"path": own_path})).unwrap();
+    assert_eq!((s.path.as_deref(), s.opened_from.as_deref()), (Some(own_path.as_str()), None));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Opening a file that would lose parts is refused unless allowed, and a damaged one is an
+/// error; either way the open project stays as it was. The dry run only reports.
+#[test]
+fn open_refuses_losses_and_bad_files_without_touching_the_open_project() {
+    let lossy = concat!(env!("CARGO_MANIFEST_DIR"), "/../aep/tests/fixtures/synthetic.aep");
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Mine", "width": 32, "height": 32, "frameRate": 30, "duration": 1})).unwrap();
+    let revision = s.revision;
+    let keeps_mine = |s: &Session| s.project.items.values().any(|i| i.name == "Mine") && s.revision == revision && s.opened_from.is_none();
+
+    let refused = s.execute("file.open", json!({"path": lossy})).unwrap_err().to_string();
+    assert!(refused.contains("opening would lose") && refused.contains("nothing was opened") && refused.contains("allowLosses"), "{refused}");
+    assert!(keeps_mine(&s));
+    let dry = s.execute("file.open", json!({"path": lossy, "dryRun": true})).unwrap();
+    assert!(dry["report"]["losses"].as_array().is_some_and(|l| !l.is_empty()), "{dry}");
+    assert!(keeps_mine(&s));
+
+    let dir = std::env::temp_dir().join(format!("ec-open-aep-bad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, bytes) in
+        [("Junk.aep", &b"not a project"[..]), ("Cut.aep", &b"RIFX\0\0\0\x40Egg!"[..]), ("Junk.aepx", &b"<?xml version=\"1.0\"?><AfterEffectsProject"[..])]
+    {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let e = s.execute("file.open", json!({"path": path.to_string_lossy()})).unwrap_err().to_string();
+        assert!(e.contains(name), "{e}");
+        assert!(keeps_mine(&s), "{name}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    s.execute("file.open", json!({"path": lossy, "allowLosses": true})).unwrap();
+    assert!(s.project.items.values().all(|i| i.name != "Mine") && s.opened_from.as_deref() == Some(lossy));
+}

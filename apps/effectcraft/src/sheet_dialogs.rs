@@ -73,7 +73,7 @@ fn open(dialog: FileDialog, frame: &eframe::Frame) -> Answer {
             }
         }
         FileDialog::OpenProject => {
-            let f = parented(frame).add_filter("EffectCraft Project", &["ecproj", "ecprojx"]).pick_file();
+            let f = parented(frame).add_filter("Project", &crate::OPEN_PROJECT_EXTENSIONS).pick_file();
             Box::pin(async move { path(f.await) })
         }
         FileDialog::Folder => {

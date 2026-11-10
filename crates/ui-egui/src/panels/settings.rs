@@ -1241,10 +1241,13 @@ pub fn recovery(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         "project" => r.project,
         _ => None,
     };
-    if let Some(p) = path
-        && let Err(e) = crate::menus::invoke(app, ctx, "file.open", json!({"path": p}))
-    {
-        app.ui.status = e;
+    if let Some(p) = path {
+        // The recovered work replaces what the launch was about to open (an After Effects project
+        // waiting on its losses prompt), as it replaces a project opened at launch.
+        app.open_requests.clear();
+        if let Err(e) = crate::menus::invoke(app, ctx, "file.open", json!({"path": p})) {
+            app.ui.status = e;
+        }
     }
 }
 

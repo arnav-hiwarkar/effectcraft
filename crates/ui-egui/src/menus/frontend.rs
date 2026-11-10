@@ -619,10 +619,13 @@ pub(super) fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) ->
         OpenFootage(&'static [&'static str]),
     }
     // Save As, Save a Copy and Save a Copy As XML start from the open project's file, in its
-    // folder, as After Effects does (#2788); an untitled project starts from Untitled Project.
+    // folder, as After Effects does (#2788); one opened from an After Effects project from that
+    // file (`Intro.aep` → `Intro.ecproj` beside it); another untitled project from Untitled Project.
     // Save a Copy adds ` copy` (`suffix`): it never writes over the open project's file.
     let project_as = |suffix: &str, ext: &str| -> std::borrow::Cow<'static, str> {
-        let Some(path) = app.session.path.as_deref().map(std::path::Path::new) else { return format!("Untitled Project{suffix}.{ext}").into() };
+        let Some(path) = app.session.path.as_deref().or(app.session.opened_from.as_deref()).map(std::path::Path::new) else {
+            return format!("Untitled Project{suffix}.{ext}").into();
+        };
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled Project".into());
         path.with_file_name(format!("{stem}{suffix}.{ext}")).to_string_lossy().into_owned().into()
     };
@@ -849,6 +852,48 @@ pub(crate) fn import_aep_projects(app: &mut EffectcraftApp, paths: Vec<String>) 
         }
     }
     errors
+}
+
+/// Files the system asked to open ([`EffectcraftApp::open_documents`]), once no dialog is up: the
+/// first project opens as File ▸ Open does (Save changes? and the After Effects losses prompt ask
+/// first), further projects are skipped with a note, and the other files import into it. While the
+/// open waits on a prompt they are skipped with a note too: they would land in the project it is
+/// about to replace.
+pub(crate) fn open_requested(app: &mut EffectcraftApp, ctx: &egui::Context) {
+    if app.open_requests.is_empty() || app.dialog.is_some() {
+        return;
+    }
+    let requests = std::mem::take(&mut app.open_requests);
+    let (projects, media): (Vec<String>, Vec<String>) = requests.into_iter().partition(|p| is_project_document(p));
+    let mut notes = Vec::new();
+    let mut waiting = false;
+    if let Some(first) = projects.first() {
+        match super::invoke(app, ctx, "file.open", json!({"path": first})) {
+            Ok(r) => waiting = super::waits_on_dialog(&r),
+            Err(e) => notes.push(e),
+        }
+    }
+    if projects.len() > 1 {
+        notes.push(crate::i18n::tr_args("Only one project can be opened at a time; skipped {} more", &[&(projects.len() - 1)]));
+    }
+    if waiting && !media.is_empty() {
+        notes.push(crate::i18n::tr_args("Skipped {} more file(s) while a dialog is open; import them again after it", &[&media.len()]));
+    } else if !media.is_empty() {
+        match super::invoke(app, ctx, "file.import", json!({"paths": media})) {
+            Ok(r) => show_result_errors(app, &r),
+            Err(e) => notes.push(e),
+        }
+    }
+    if !notes.is_empty() {
+        app.ui.status = notes.join("; ");
+    }
+}
+
+/// Whether `path` opens as a project: EffectCraft's own (`.ecproj`, `.ecprojx`) or an After
+/// Effects project (opened converted).
+fn is_project_document(path: &str) -> bool {
+    let ext = std::path::Path::new(path).extension().and_then(std::ffi::OsStr::to_str);
+    ext.is_some_and(|e| e.eq_ignore_ascii_case("ecproj") || e.eq_ignore_ascii_case("ecprojx")) || effectcraft_engine::commands::is_aep_path(path)
 }
 
 /// File ▸ Import ▸ File… with After Effects projects picked: they import first, as projects

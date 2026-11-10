@@ -296,9 +296,9 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
     if crate::panels::unprecompose::guard(app, id, &params)? {
         return Ok(json!({"dialog": "unprecompose"}));
     }
-    // An After Effects import with a path that loses something asks first (the menu's file
-    // dialog asks in `run_with_picked`).
-    if params.get("path").is_some() && crate::panels::aep_losses::guard(app, id, &params)? {
+    // An After Effects import or open with a path (Open Recent: its place in the list) that loses
+    // something asks first (the menu's file dialog asks in `run_with_picked`).
+    if (params.get("path").is_some() || id == "file.openRecent") && crate::panels::aep_losses::guard(app, id, &params)? {
         return Ok(json!({"dialog": "aepLosses"}));
     }
     // J / K and Select All Keyframes act on what the Timeline shows (its revealed properties).

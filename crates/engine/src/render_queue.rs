@@ -440,10 +440,12 @@ async fn run_work(w: Work, shared: &JobShared, notify: &mut dyn FnMut(&JobShared
 }
 
 impl Session {
-    /// The project's name for `[projectName]` (file stem, or "Untitled Project").
+    /// The project's name for `[projectName]` (file stem, the After Effects project's it was opened
+    /// from, or "Untitled Project").
     pub fn project_name(&self) -> String {
         self.path
             .as_deref()
+            .or(self.opened_from.as_deref())
             .and_then(|p| std::path::Path::new(p).file_stem())
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "Untitled Project".into())

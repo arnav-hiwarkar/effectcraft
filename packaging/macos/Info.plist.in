@@ -77,6 +77,21 @@
       <key>LSItemContentTypes</key>
       <array><string>ai.storyteller.effectcraft.document</string></array>
     </dict>
+    <!-- After Effects projects open converted into an untitled project (File ▸ Open). Named by
+         extension only; Alternate keeps EffectCraft in Open With without becoming their default. -->
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>After Effects Project</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>aep</string>
+        <string>aepx</string>
+      </array>
+    </dict>
   </array>
   <!-- EffectCraft's own format: the project (.ecproj) and its XML copy (.ecprojx). -->
   <key>UTExportedTypeDeclarations</key>

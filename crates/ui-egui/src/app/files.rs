@@ -8,4 +8,12 @@ impl EffectcraftApp {
             self.dialog = Some(Dialog::Recovery);
         }
     }
+
+    /// Open files the system asked the app to open (an After Effects project given on the command
+    /// line, double-clicked or opened with EffectCraft, or picked in the browser's Open Project
+    /// dialog), as File ▸ Open does: Save changes? and the losses prompt ask first. They open in
+    /// the next frame without a dialog up (after the recovery offer).
+    pub fn open_documents(&mut self, paths: Vec<String>) {
+        self.open_requests.extend(paths);
+    }
 }

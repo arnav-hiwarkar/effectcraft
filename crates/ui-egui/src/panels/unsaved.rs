@@ -76,19 +76,26 @@ pub fn quit_on_close(ctx: &egui::Context) -> bool {
     craft_quit::on_close_request(ctx)
 }
 
-/// The project's display name: its file name, or `Untitled Project.ecproj`.
+/// The project's display name: its file name, `Intro.aep (converted)` for an untitled project
+/// opened from an After Effects project, or `Untitled Project.ecproj`.
 pub fn project_name(app: &EffectcraftApp) -> String {
-    app.session
-        .path
-        .as_deref()
-        .and_then(|p| std::path::Path::new(p).file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "Untitled Project.ecproj".into())
+    let name = |p: &str| std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned());
+    if let Some(name) = app.session.path.as_deref().and_then(name) {
+        return name;
+    }
+    match app.session.opened_from.as_deref().and_then(name) {
+        Some(name) => format!("{name} (converted)"),
+        None => "Untitled Project.ecproj".into(),
+    }
 }
 
 /// The window title: the project's path (or name) and `*` while it has unsaved changes.
 pub fn window_title(app: &EffectcraftApp) -> String {
-    let doc = app.session.path.clone().unwrap_or_else(|| project_name(app));
+    let doc = match (&app.session.path, &app.session.opened_from) {
+        (Some(path), _) => path.clone(),
+        (None, Some(from)) => format!("{from} (converted)"),
+        (None, None) => project_name(app),
+    };
     format!("EffectCraft - {doc}{}", if app.session.is_dirty() { " *" } else { "" })
 }
 

@@ -235,6 +235,7 @@ impl Session {
         self.history = History::default();
         self.state = EditorState { snapping: true, view_layout: 1, ..Default::default() };
         self.path = path;
+        self.opened_from = None;
         self.bump();
         self.mark_saved();
         let first = self.project.comps().next().map(|(id, _)| *id);

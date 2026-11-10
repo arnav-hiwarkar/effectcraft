@@ -1,6 +1,6 @@
 # Where EffectCraft falls short
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-30 · **Change:** minor (gap 25, second slice: Info, Flowchart, Script Console and the 3D Camera Tracker block named, described and keyboard-operable, #1335; earlier change: gap 4 closed: every pull request and push to `main` runs `cargo xtask ci` in CI, #2204; earlier change: gap 25: an AccessKit audit test and a theme contrast test, Effects & Presets, Settings and Render Queue named and keyboard-operable, #1335; earlier change: path-editing layer bounds, #1220; issue, PR and catalog references gap 21: percentage guides and effect colour labels in; earlier change: re-audited against `upstream/main` 470ea7a3; ranked gap list from the 10 October re-measure otherwise unchanged) · **Target:** Adobe After Effects 2026 (26.5.0.89)
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-11-10 · **Change:** G4 notes that File ▸ Open opens an `.aep` converted; before that: minor (gap 25, second slice: Info, Flowchart, Script Console and the 3D Camera Tracker block named, described and keyboard-operable, #1335; earlier change: gap 4 closed: every pull request and push to `main` runs `cargo xtask ci` in CI, #2204; earlier change: gap 25: an AccessKit audit test and a theme contrast test, Effects & Presets, Settings and Render Queue named and keyboard-operable, #1335; earlier change: path-editing layer bounds, #1220; issue, PR and catalog references gap 21: percentage guides and effect colour labels in; earlier change: re-audited against `upstream/main` 470ea7a3; ranked gap list from the 10 October re-measure otherwise unchanged) · **Target:** Adobe After Effects 2026 (26.5.0.89)
 
 An honest assessment of how far EffectCraft is from being a real replacement for After Effects,
 and the work that closes the gap. This document is meant for contributors and agents choosing
@@ -265,6 +265,9 @@ Issues #41–#47 (all from the Linux AppImage 0.1.1, 5 October): panning the vie
   `.ecproj`, the way ffmpeg is used only from outside), or its format knowledge could be ported.
   The second means reading another implementation of the format, which AGENTS.md rules out
   unless the clean-room scope allows it.
+- File ▸ Open (Open Recent, the Home screen, launch arguments, a Finder double-click or Open With)
+  opens an `.aep` / `.aepx` converted, as an untitled project ([aep-import.md](aep-import.md),
+  "Opening a project"); dropping one on the window imports it.
 - Also in this area: relative footage paths and relinking when a project moves (gap 18).
 - Placed PDF / Illustrator footage of an `.aep` is framed as After Effects places it (the ArtBox
   clipped to the crop box, `/Rotate` ignored) and drawn to fill the size After Effects stored

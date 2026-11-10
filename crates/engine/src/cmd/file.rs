@@ -43,6 +43,11 @@ fn demo(s: &mut Session, _: &Value) -> Result<Value> {
 pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("file.open", "missing `path`"))?;
     let bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
+    // An After Effects project (by its name, or by its content whatever it is called) opens
+    // converted, as an untitled project.
+    if super::is_aep_path(path) || super::aep::is_aep_content(&bytes) {
+        return super::aep::open_aep(s, p, path, &bytes);
+    }
     let text = String::from_utf8(bytes).map_err(|_| EngineError::Other("not a text project file".into()))?;
     // XML copies (File ▸ Save a Copy As XML…) open like the JSON project.
     let text = if crate::xml_project::is_xml(&text) { crate::xml_project::from_xml(&text).map_err(EngineError::Other)? } else { text };
@@ -789,7 +794,15 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("file.newProject", "New Project", ["File", "New"], Some("Cmd+Alt+N"), "{}", always, new_project),
         cmd!("file.openDemoProject", "Open Demo Project", ["Help"], None, "{}", always, demo),
-        cmd!("file.open", "Open Project...", ["File"], Some("Cmd+O"), "{path}", always, open),
+        cmd!(
+            "file.open",
+            "Open Project...",
+            ["File"],
+            Some("Cmd+O"),
+            "{path (.ecproj, .ecprojx, or an After Effects .aep / .aepx, opened converted as an untitled project), allowLosses?: bool (After Effects: open although parts cannot be converted), dryRun?: bool (After Effects: only return the report)}",
+            always,
+            open
+        ),
         cmd!("file.save", "Save", ["File"], Some("Cmd+S"), "{path?}", always, save),
         cmd!("file.saveAs", "Save As...", ["File", "Save As"], Some("Cmd+Shift+S"), "{path}", always, save_as),
         cmd!("file.incrementAndSave", "Increment and Save", ["File"], Some("Cmd+Alt+Shift+S"), "{}", has_path, increment_save),

@@ -369,6 +369,9 @@ pub struct EffectcraftApp {
     pub(crate) file_dialogs: FileDialogsUp,
     /// Commands from the native menu bar.
     pub command_inbox: Option<Receiver<String>>,
+    /// Files the system asked to open ([`EffectcraftApp::open_documents`]), waiting for the
+    /// frame that opens them.
+    pub(crate) open_requests: Vec<String>,
     /// Pointer position in comp pixels (Info panel).
     pub(crate) pointer_comp: Option<[f32; 2]>,
     pub(crate) dialog_state: panels::dialogs::DialogState,

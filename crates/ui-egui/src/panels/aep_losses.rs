@@ -1,8 +1,10 @@
-//! File ▸ Import / Export ▸ Adobe After Effects Project… from the menu: what the conversion cannot
-//! carry over is shown first (the command's dry run), and the user chooses to cancel or to go on
-//! with those losses (`allowLosses`). Cancel changes nothing; a conversion without losses runs at
-//! once. Agents running `file.importAep` / `file.exportAep` with `engine.execute` are never asked:
-//! they pass `allowLosses` or get the refusal. After Effects projects dropped or picked together
+//! File ▸ Import / Export ▸ Adobe After Effects Project… and File ▸ Open (Open Recent, the Home
+//! screen, a file the system asks to open) of an After Effects project from the menu: what the
+//! conversion cannot carry over is shown first (the command's dry run), and the user chooses to
+//! cancel or to go on with those losses (`allowLosses`). Cancel changes nothing (an open keeps the
+//! open project); a conversion without losses runs at once. Agents running `file.importAep` /
+//! `file.exportAep` / `file.open` with `engine.execute` are never asked: they pass `allowLosses` or
+//! get the refusal. After Effects projects dropped or picked together
 //! (File ▸ Import ▸ File…) are asked about one at a time: the others wait in the queue until the
 //! prompt is answered, and Cancel skips only the one it asks about.
 //!
@@ -49,15 +51,30 @@ pub fn take_unanswered(app: &mut EffectcraftApp) -> Vec<String> {
 /// holding the command and the caller must not run it. `Err` when the dry run fails (the file
 /// cannot be read or is not a project), with the message.
 pub fn guard(app: &mut EffectcraftApp, id: &str, params: &Value) -> Result<bool, String> {
-    if !matches!(id, "file.importAep" | "file.exportAep")
-        || params.get("allowLosses") == Some(&Value::Bool(true))
-        || params.get("dryRun") == Some(&Value::Bool(true))
-    {
+    if params.get("allowLosses") == Some(&Value::Bool(true)) || params.get("dryRun") == Some(&Value::Bool(true)) {
         return Ok(false);
     }
+    // Opening an After Effects project (Open Recent by its place in the list) is asked about as
+    // `file.open` of its path, which the answer runs.
+    let opened;
+    let (id, params) = match id {
+        "file.importAep" | "file.exportAep" => (id, params),
+        "file.open" | "file.openRecent" => {
+            let Some(path) = opened_path(app, params).filter(|p| opens_converted(app, p)) else { return Ok(false) };
+            opened = json!({"path": path});
+            ("file.open", &opened)
+        }
+        _ => return Ok(false),
+    };
     let mut dry = params.as_object().cloned().unwrap_or_default();
     dry.insert("dryRun".into(), Value::Bool(true));
-    let r = app.session.execute(id, Value::Object(dry)).map_err(|e| e.to_string())?;
+    let r = match app.session.execute(id, Value::Object(dry)) {
+        Ok(r) => r,
+        // A file that cannot be opened is reported by the open itself (Open Recent then drops a
+        // project that is gone from its list).
+        Err(_) if id == "file.open" => return Ok(false),
+        Err(e) => return Err(e.to_string()),
+    };
     let report = r.get("report").cloned().unwrap_or(Value::Null);
     if report["losses"].as_array().is_none_or(|l| l.is_empty()) {
         return Ok(false);
@@ -68,6 +85,48 @@ pub fn guard(app: &mut EffectcraftApp, id: &str, params: &Value) -> Result<bool,
     app.dialog_state.aep_losses.command = Some((id.to_string(), params.clone(), report));
     app.dialog = Some(Dialog::AepLosses);
     Ok(true)
+}
+
+/// The project file `file.open` / `file.openRecent` with `params` opens (Open Recent: its `path`,
+/// else its `index` in the list, else the first).
+fn opened_path(app: &EffectcraftApp, params: &Value) -> Option<String> {
+    if let Some(path) = params.get("path").and_then(Value::as_str) {
+        return Some(path.to_string());
+    }
+    let recent = &app.session.prefs.recent_projects;
+    match params.get("index").and_then(Value::as_u64) {
+        Some(i) => usize::try_from(i).ok().and_then(|i| recent.get(i)).cloned(),
+        None => recent.first().cloned(),
+    }
+}
+
+/// Whether `file.open` of `path` opens an After Effects project, as the engine decides: by its
+/// name, or by its content when it is not named as an EffectCraft project (those are not read
+/// twice for this).
+fn opens_converted(app: &EffectcraftApp, path: &str) -> bool {
+    if effectcraft_engine::commands::is_aep_path(path) {
+        return true;
+    }
+    let ext = std::path::Path::new(path).extension().and_then(std::ffi::OsStr::to_str);
+    if ext.is_some_and(|e| e.eq_ignore_ascii_case("ecproj") || e.eq_ignore_ascii_case("ecprojx")) {
+        return false;
+    }
+    app.session.services.read_file(path).is_ok_and(|bytes| effectcraft_engine::commands::is_aep_content(&bytes))
+}
+
+/// What the prompt asks about: the title, the question and the go-on button.
+fn wording(id: &str) -> (&'static str, &'static str, &'static str) {
+    match id {
+        "file.importAep" => {
+            (tr("Import Adobe After Effects Project"), tr("Some parts of this project cannot be imported exactly (left out or changed):"), tr("Import Anyway"))
+        }
+        "file.open" => {
+            (tr("Open Adobe After Effects Project"), tr("Some parts of this project cannot be opened exactly (left out or changed):"), tr("Open Anyway"))
+        }
+        _ => {
+            (tr("Export Adobe After Effects Project"), tr("Some parts of this project cannot be exported exactly (left out or changed):"), tr("Export Anyway"))
+        }
+    }
 }
 
 /// A loss category (`snake_case` in the report) as words: `layer_styles` → `Layer styles`.
@@ -95,16 +154,10 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         app.dialog = None;
         return;
     };
-    let import = id == "file.importAep";
-    let title = if import { "Import Adobe After Effects Project" } else { "Export Adobe After Effects Project" };
+    let (title, question, go) = wording(&id);
     let mut answer: Option<bool> = None;
     super::dialogs::modal(ctx, title, vec2(520.0, 340.0), t, |ui| {
-        let text = if import {
-            tr("Some parts of this project cannot be imported exactly (left out or changed):")
-        } else {
-            tr("Some parts of this project cannot be exported exactly (left out or changed):")
-        };
-        ui.label(egui::RichText::new(text).color(t.tab_text_active));
+        ui.label(egui::RichText::new(question).color(t.tab_text_active));
         ui.add_space(6.0);
         egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
             for (head, details) in lines(&report) {
@@ -116,7 +169,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         });
         ui.add_space(14.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let label = if import { tr("Import Anyway") } else { tr("Export Anyway") };
+            let label = go;
             let r = ui.button(label);
             app.auto.add("dialog.aepLosses.continue", r.rect, label);
             if r.clicked() {
@@ -312,5 +365,59 @@ mod tests {
         assert!(app.session.project.items.is_empty(), "the dry run imported nothing");
         finish(&mut app, &ctx, true);
         assert!(app.dialog.is_none() && !app.session.project.items.is_empty(), "Import Anyway imported the project");
+    }
+
+    /// Opening an After Effects project that loses parts asks after Save changes?, as an open;
+    /// Cancel keeps the open project as it was, Open Anyway opens it converted. Open Recent of it
+    /// (by its place in the list) asks again.
+    #[test]
+    fn opening_a_lossy_project_asks_first_and_cancel_keeps_the_open_one() {
+        let ctx = egui::Context::default();
+        let dir = std::env::temp_dir().join(format!("ec-open-lossy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lossy = dir.join("Lossy.aep");
+        std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/../aep/tests/fixtures/synthetic.aep"), &lossy).unwrap();
+        let lossy = lossy.to_string_lossy().to_string();
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.session.execute("comp.new", json!({"name": "Mine", "width": 32, "height": 32, "frameRate": 30, "duration": 1})).unwrap();
+        let mine = |app: &EffectcraftApp| app.session.project.items.values().any(|i| i.name == "Mine");
+
+        let r = crate::menus::invoke(&mut app, &ctx, "file.open", json!({"path": lossy})).unwrap();
+        assert!(crate::menus::waits_on_dialog(&r) && app.dialog == Some(Dialog::UnsavedChanges), "Save changes? first");
+        // Don't Save: the command runs again, answered.
+        let again = |app: &mut EffectcraftApp| {
+            app.dialog = None;
+            app.dialog_state.unsaved.command = None;
+            app.dialog_state.unsaved.answered = true;
+            crate::menus::invoke(app, &ctx, "file.open", json!({"path": lossy})).unwrap()
+        };
+        again(&mut app);
+        assert!(asking(&app), "then the losses");
+        let (id, _, _) = app.dialog_state.aep_losses.command.clone().unwrap();
+        assert_eq!(
+            wording(&id),
+            ("Open Adobe After Effects Project", "Some parts of this project cannot be opened exactly (left out or changed):", "Open Anyway")
+        );
+        finish(&mut app, &ctx, false);
+        assert!(mine(&app) && app.session.is_dirty() && app.session.opened_from.is_none(), "Cancel keeps the open project");
+
+        again(&mut app);
+        finish(&mut app, &ctx, true);
+        assert!(!mine(&app) && !app.session.is_dirty(), "{}", app.ui.status);
+        assert_eq!((app.session.path.as_deref(), app.session.opened_from.as_deref()), (None, Some(lossy.as_str())));
+
+        let r = crate::menus::invoke(&mut app, &ctx, "file.openRecent", json!({"index": 0})).unwrap();
+        assert!(crate::menus::waits_on_dialog(&r) && asking(&app));
+        assert_eq!(app.dialog_state.aep_losses.command.as_ref().map(|(id, p, _)| (id.as_str(), p.clone())), Some(("file.open", json!({"path": lossy}))));
+
+        // Named otherwise, it is still recognised by its content and asks first.
+        app.dialog = None;
+        app.dialog_state.aep_losses.command = None;
+        let renamed = dir.join("Lossy.project");
+        std::fs::copy(&lossy, &renamed).unwrap();
+        let renamed = renamed.to_string_lossy().to_string();
+        let r = crate::menus::invoke(&mut app, &ctx, "file.open", json!({"path": renamed})).unwrap();
+        assert!(crate::menus::waits_on_dialog(&r) && asking(&app), "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

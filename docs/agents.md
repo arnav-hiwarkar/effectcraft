@@ -325,7 +325,10 @@ build real projects through these interfaces; they are worked examples of everyt
 * **Projects**: `file.import` takes `.ecproj` / `.ecprojx` and After Effects projects (`.aep`, `.aepx`)
   too, each into a folder named after it (`projects` in the result). An After Effects project that
   would lose parts is refused (an `errors` entry, nothing imported): `file.importAep {"path": …,
-  "dryRun": true}` lists the losses, `"allowLosses": true` imports the rest.
+  "dryRun": true}` lists the losses, `"allowLosses": true` imports the rest. `file.open` of an After
+  Effects project opens it converted, as an untitled project (`{path, converted: true, comps,
+  report}`), with the same `dryRun` and `allowLosses`; in the desktop app `ui.menu.invoke` asks with
+  the losses prompt (`dialog.aepLosses.continue` / `cancel`).
 * **Image sequences**: `file.import {"paths":["/r/shot_0001.png"], "sequence": true}` imports the
   file's whole numbered run as one item (several picked frames: that range; a folder: each run in
   it, also without `sequence`). Without `"sequence": true` a picked or dropped numbered file imports

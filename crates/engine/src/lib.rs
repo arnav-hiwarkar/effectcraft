@@ -117,6 +117,10 @@ pub struct Session {
     /// snapshot, so undoing back to the saved state clears the modified mark.
     pub saved_project: Arc<Project>,
     pub path: Option<String>,
+    /// The After Effects project this untitled project was converted from when it opened
+    /// (`file.open` of an `.aep` / `.aepx`): Save As starts from its name and folder, the window
+    /// title names it. Never written to; cleared when the project is replaced.
+    pub opened_from: Option<String>,
     pub state: EditorState,
     pub services: Arc<dyn Services>,
     pub footage: Arc<dyn FootageSource>,
@@ -324,6 +328,7 @@ impl Default for Session {
             ime_revision: commands::text_edit::next_ime_revision().unwrap_or(u64::MAX),
             saved_revision: 0,
             path: None,
+            opened_from: None,
             state: EditorState { snapping: true, view_layout: 1, ..Default::default() },
             services: Arc::new(FsServices),
             footage: Arc::new(NoFootage),

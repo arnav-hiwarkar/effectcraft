@@ -101,6 +101,7 @@ impl EffectcraftApp {
             dialog_answers: std::sync::mpsc::channel(),
             file_dialogs: FileDialogsUp::default(),
             command_inbox: None,
+            open_requests: Vec::new(),
             pointer_comp: None,
             dialog_state: Default::default(),
             integrated_titlebar: false,

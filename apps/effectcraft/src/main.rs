@@ -48,14 +48,27 @@ fn app_icon() -> egui::IconData {
     eframe::icon_data::from_png_bytes(png).unwrap_or_default()
 }
 
-/// Both native JSON projects and Save a Copy As XML projects are openable on launch.
+/// Both native JSON projects and Save a Copy As XML projects are openable on launch, and After
+/// Effects projects open converted ([`is_aep_project`]).
 /// Keep this classification shared by project opening and the subsequent media-import pass.
 fn is_project_file(path: &str) -> bool {
     std::path::Path::new(path)
         .extension()
         .and_then(std::ffi::OsStr::to_str)
         .is_some_and(|ext| ext.eq_ignore_ascii_case("ecproj") || ext.eq_ignore_ascii_case("ecprojx"))
+        || is_aep_project(path)
 }
+
+/// An After Effects project opens converted. One that would lose parts opens through the app once
+/// it is up ([`effectcraft_ui_egui::EffectcraftApp::open_documents`]), where the losses prompt asks
+/// first; a launch-time open could only refuse it. macOS open events with one go there too.
+fn is_aep_project(path: &str) -> bool {
+    effectcraft_engine::commands::is_aep_path(path)
+}
+
+/// The project filter of the Open Project dialogs: EffectCraft projects and After Effects
+/// projects (opened converted).
+const OPEN_PROJECT_EXTENSIONS: [&str; 4] = ["ecproj", "ecprojx", "aep", "aepx"];
 
 /// winit 0.30 cannot deliver native Wayland file drops. XWayland can.
 #[cfg(target_os = "linux")]
@@ -330,16 +343,27 @@ fn run_desktop(reporter: &crash_report::Shutdown) -> eframe::Result {
             // a toast).
             let _ = session.execute("file.runStartupScripts", json!({}));
             let recovery = if control_port.is_none() { session.begin_recovery() } else { None };
-            let project = files.iter().find(|f| is_project_file(f)).cloned();
-            if let Some(p) = project {
-                if let Err(e) = session.execute("file.open", json!({"path": p})) {
-                    log::warn!("{p}: {e}");
+            let projects: Vec<String> = files.iter().filter(|f| is_project_file(f)).cloned().collect();
+            let media: Vec<String> = files.iter().filter(|f| !is_project_file(f)).cloned().collect();
+            // An After Effects project that would lose parts waits for the app, which asks first
+            // (`open_documents` below), and the files given with it wait with it.
+            let mut asks = None;
+            if let Some(p) = projects.first() {
+                match session.execute("file.open", json!({"path": p})) {
+                    Ok(_) => {}
+                    Err(effectcraft_engine::EngineError::Refused { .. }) if is_aep_project(p) => {
+                        asks = Some(projects.iter().chain(&media).cloned().collect::<Vec<_>>());
+                    }
+                    Err(e) => log::warn!("{p}: {e}"),
+                }
+                if asks.is_none() && projects.len() > 1 {
+                    log::warn!("only one project opens at launch; skipped {:?}", projects.get(1..).unwrap_or_default());
                 }
             } else if demo {
                 let _ = session.execute("file.openDemoProject", json!({}));
             }
-            let media: Vec<String> = files.iter().filter(|f| !is_project_file(f)).cloned().collect();
-            if !media.is_empty()
+            if asks.is_none()
+                && !media.is_empty()
                 && let Err(e) = session.execute("file.import", json!({"paths": media}))
             {
                 log::warn!("import: {e}");
@@ -357,6 +381,9 @@ fn run_desktop(reporter: &crash_report::Shutdown) -> eframe::Result {
             }
             if let Some(r) = recovery {
                 app.offer_recovery(r);
+            }
+            if let Some(paths) = asks {
+                app.open_documents(paths);
             }
             #[cfg(target_os = "linux")]
             if let Some(note) = wayland_drop_notice(std::env::var_os("WAYLAND_DISPLAY").as_deref(), std::env::var_os("WINIT_UNIX_BACKEND").as_deref())
@@ -386,9 +413,8 @@ fn run_desktop(reporter: &crash_report::Shutdown) -> eframe::Result {
                         .show();
                 }));
             }
-            app.hooks.pick_open_project = Some(Box::new(|| {
-                rfd::FileDialog::new().add_filter("EffectCraft Project", &["ecproj", "ecprojx"]).pick_file().map(|p| p.to_string_lossy().to_string())
-            }));
+            app.hooks.pick_open_project =
+                Some(Box::new(|| rfd::FileDialog::new().add_filter("Project", &OPEN_PROJECT_EXTENSIONS).pick_file().map(|p| p.to_string_lossy().to_string())));
             app.hooks.system_theme = appearance::service();
             app.hooks.audio_device = Some(Box::new(audio_out::open));
             app.hooks.audio_devices = Some(Box::new(audio_out::devices));
@@ -575,7 +601,12 @@ impl eframe::App for Desktop {
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         #[cfg(target_os = "macos")]
-        self.apple_events.feed(self.app.is_ready(), ctx, raw_input);
+        {
+            let projects = self.apple_events.feed(self.app.is_ready(), ctx, raw_input);
+            if !projects.is_empty() {
+                self.app.open_documents(projects);
+            }
+        }
         self.app.raw_input_hook(ctx, raw_input);
     }
 }
@@ -698,6 +729,19 @@ mod tests {
         let files = ["scene.ecprojx".to_string(), "clip.mov".to_string()];
         assert_eq!(files.iter().find(|f| super::is_project_file(f)).map(String::as_str), Some("scene.ecprojx"));
         assert_eq!(files.iter().filter(|f| !super::is_project_file(f)).map(String::as_str).collect::<Vec<_>>(), vec!["clip.mov"],);
+    }
+
+    /// An After Effects project given on the command line (or by Finder) is a project that opens,
+    /// converted, through the app: not media for File ▸ Import. The Open Project dialogs offer it.
+    #[test]
+    fn launch_opens_after_effects_projects_through_the_app() {
+        for path in ["Intro.aep", "/tmp/Shot.AEPX"] {
+            assert!(super::is_project_file(path) && super::is_aep_project(path), "{path}");
+        }
+        for path in ["Intro.ecproj", "clip.aep.mov", "aep"] {
+            assert!(!super::is_aep_project(path), "{path}");
+        }
+        assert_eq!(super::OPEN_PROJECT_EXTENSIONS, ["ecproj", "ecprojx", "aep", "aepx"]);
     }
 
     /// Launching without a project opens an empty project, not the demo (#204).

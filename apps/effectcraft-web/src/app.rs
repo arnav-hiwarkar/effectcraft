@@ -207,8 +207,18 @@ fn install_hooks(app: &mut EffectcraftApp) {
         // the import happens when the browser hands over the files
         Vec::new()
     }));
+    // After Effects projects open converted, as File ▸ Open does on the desktop (the losses prompt
+    // asks first); they are opened by the next frame.
     app.hooks.pick_open_project = Some(Box::new(|| {
-        if let Err(e) = files::pick(".ecproj", false, |paths| post(move |app| open_or_import(app, paths))) {
+        let opened = |app: &mut EffectcraftApp, paths: Vec<String>| {
+            if paths.iter().any(|p| effectcraft_engine::commands::is_aep_path(p)) {
+                app.open_documents(paths);
+                repaint();
+            } else {
+                open_or_import(app, paths);
+            }
+        };
+        if let Err(e) = files::pick(".ecproj,.aep,.aepx", false, move |paths| post(move |app| opened(app, paths))) {
             log::warn!("file picker: {e:?}");
         }
         None

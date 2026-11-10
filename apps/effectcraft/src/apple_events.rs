@@ -46,8 +46,12 @@ pub struct Opened {
 
 impl Opened {
     /// Hand the documents to the dropped-file handling once the UI is `ready` (a project opens,
-    /// asking about unsaved changes first; media is imported), and act on quit requests.
-    pub fn feed(&mut self, ready: bool, ctx: &egui::Context, raw: &mut egui::RawInput) {
+    /// asking about unsaved changes first; media is imported), and act on quit requests. Documents
+    /// with an After Effects project among them are returned instead, all of them, to be opened in
+    /// order ([`effectcraft_ui_egui::EffectcraftApp::open_documents`]: the project opens, as a
+    /// Finder double-click or Open With does in After Effects, where a drop would import it; the
+    /// other files go into it once it opened, not into the project it replaces).
+    pub fn feed(&mut self, ready: bool, ctx: &egui::Context, raw: &mut egui::RawInput) -> Vec<String> {
         for e in self.inbox.drain() {
             match e {
                 Event::Open(paths) => self.pending.extend(paths),
@@ -55,13 +59,18 @@ impl Opened {
             }
         }
         if self.pending.is_empty() {
-            return;
+            return Vec::new();
         }
         if !ready {
             ctx.request_repaint();
-            return;
+            return Vec::new();
         }
-        raw.dropped_files.extend(self.pending.drain(..).map(|p| Arc::new(OpenedFile(p)) as egui::DroppedFileHandle));
+        let paths: Vec<PathBuf> = self.pending.drain(..).collect();
+        if paths.iter().any(|p| crate::is_aep_project(&p.to_string_lossy())) {
+            return paths.into_iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        }
+        raw.dropped_files.extend(paths.into_iter().map(|p| Arc::new(OpenedFile(p)) as egui::DroppedFileHandle));
+        Vec::new()
     }
 }
 

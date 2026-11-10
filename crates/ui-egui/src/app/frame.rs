@@ -249,6 +249,7 @@ impl EffectcraftApp {
             return;
         }
         self.run_dialog_answers();
+        menus::open_requested(self, ctx);
         if self.session.script_ui.render_host.is_some() {
             self.tick_script_render(ctx);
             return;

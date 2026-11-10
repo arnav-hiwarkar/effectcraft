@@ -853,3 +853,69 @@ fn a_picked_project_with_losses_asks_and_the_next_waits() {
     assert!(app.session.project.items.is_empty(), "nothing imported before the answer");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A small After Effects project without losses, `<dir>/Intro.aep` with a composition `Intro`.
+fn exported_aep(dir: &std::path::Path) -> String {
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join("Intro.aep").to_string_lossy().to_string();
+    let mut s = effectcraft_engine::Session::default();
+    s.execute("comp.new", json!({"name": "Intro", "width": 64, "height": 36, "frameRate": 30, "duration": 1})).unwrap();
+    s.execute("file.exportAep", json!({"path": path, "allowLosses": true})).unwrap();
+    path
+}
+
+/// File ▸ Open (here the path picked in its dialog) of an After Effects project opens it
+/// converted: an untitled project the window title names after the file, leaving the Home
+/// screen; Save As starts from `Intro.ecproj` beside the file.
+#[test]
+fn an_opened_after_effects_project_is_untitled_and_saves_beside_it() {
+    use std::sync::{Arc, Mutex};
+    let ctx = egui::Context::default();
+    let dir = std::env::temp_dir().join(format!("ec-open-aep-ui-{}", std::process::id()));
+    let intro = exported_aep(&dir);
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    app.ui.start_screen = true;
+    super::frontend::dialog_answered(&mut app, crate::DialogAnswer { command: "file.open".into(), key: "path", params: json!({}), paths: vec![intro.clone()] });
+    assert!(app.session.project.items.values().any(|i| i.name == "Intro"), "{}", app.ui.status);
+    assert!(!app.ui.start_screen, "it leaves the Home screen");
+    assert_eq!((app.session.path.as_deref(), app.session.opened_from.as_deref()), (None, Some(intro.as_str())));
+    assert_eq!(crate::panels::unsaved::project_name(&app), "Intro.aep (converted)");
+    assert_eq!(crate::panels::unsaved::window_title(&app), format!("EffectCraft - {intro} (converted)"));
+
+    let pending: Arc<Mutex<Vec<crate::FileDialog>>> = Arc::default();
+    let queue = pending.clone();
+    app.hooks.file_dialog_async = Some(Box::new(move |dialog, _done| queue.lock().unwrap().push(dialog)));
+    invoke(&mut app, &ctx, "file.save", json!({})).unwrap();
+    let dialog = pending.lock().unwrap().pop().expect("Save asks for a path");
+    let beside = dir.join("Intro.ecproj").to_string_lossy().to_string();
+    assert_eq!(dialog, crate::FileDialog::Save { default: beside, ext: "ecproj".into(), project: true });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Files the system asks to open wait while a dialog is up; then the first project opens, the
+/// other projects are skipped with a note, and so are the other files while the open waits on
+/// the losses prompt (they would land in the project it replaces).
+#[test]
+fn files_the_system_opens_open_the_first_project() {
+    let ctx = egui::Context::default();
+    let dir = std::env::temp_dir().join(format!("ec-open-documents-{}", std::process::id()));
+    let intro = exported_aep(&dir);
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    app.dialog = Some(crate::Dialog::About);
+    app.open_documents(vec![intro.clone(), dir.join("Other.ecproj").to_string_lossy().to_string()]);
+    super::open_requested(&mut app, &ctx);
+    assert!(app.session.opened_from.is_none(), "not while a dialog is up");
+    app.dialog = None;
+    super::open_requested(&mut app, &ctx);
+    assert_eq!(app.session.opened_from.as_deref(), Some(intro.as_str()));
+    assert!(app.ui.status.contains("skipped 1 more"), "{}", app.ui.status);
+
+    let lossy = dir.join("Lossy.aep");
+    std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/../aep/tests/fixtures/synthetic.aep"), &lossy).unwrap();
+    app.open_documents(vec![lossy.to_string_lossy().to_string(), dir.join("clip.png").to_string_lossy().to_string()]);
+    super::open_requested(&mut app, &ctx);
+    assert!(crate::panels::aep_losses::asking(&app), "the losses prompt asks");
+    assert!(app.ui.status.contains("Skipped 1 more file(s)"), "{}", app.ui.status);
+    assert_eq!(app.session.opened_from.as_deref(), Some(intro.as_str()), "nothing opened yet");
+    let _ = std::fs::remove_dir_all(&dir);
+}
